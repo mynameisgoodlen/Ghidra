@@ -17,7 +17,7 @@ jobs:
 
       - name: Rebuild library from parts
         run: |
-          cat parts/part_* | xz -d > libminecraftpe.so
+          sudo apt-get install -y p7zip-full >/dev/null; 7z e -y parts/*.7z.001
           ls -la libminecraftpe.so
           file libminecraftpe.so
 
