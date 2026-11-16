@@ -1,0 +1,86 @@
+name: analyze-libminecraftpe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rebuild library from parts
+        run: |
+          cat parts/part_* | xz -d > libminecraftpe.so
+          ls -la libminecraftpe.so
+          file libminecraftpe.so
+
+      - name: Strings map (fast, always useful)
+        run: bash scripts/strings_map.sh libminecraftpe.so out/strings
+
+      - name: Upload strings map
+        uses: actions/upload-artifact@v4
+        with:
+          name: strings-map
+          path: out/strings
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Add swap (Ghidra is memory hungry)
+        continue-on-error: true
+        run: |
+          sudo fallocate -l 8G /mnt/swapfile2
+          sudo chmod 600 /mnt/swapfile2
+          sudo mkswap /mnt/swapfile2
+          sudo swapon /mnt/swapfile2
+          free -h
+
+      - name: Download latest Ghidra
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p tools dl
+          gh release download -R NationalSecurityAgency/ghidra -p 'ghidra_*_PUBLIC_*.zip' -D dl --clobber
+          unzip -q dl/ghidra_*.zip -d tools
+          echo "GHIDRA_HOME=$(ls -d "$PWD"/tools/ghidra_*)" >> "$GITHUB_ENV"
+
+      - name: Ghidra headless analysis (can take hours)
+        continue-on-error: true
+        run: |
+          for f in "$GHIDRA_HOME/support/analyzeHeadless" "$GHIDRA_HOME/support/launch.properties"; do
+            sed -i -E 's/^(MAXMEM=).*/\15G/' "$f" || true
+          done
+          grep -n "MAXMEM" "$GHIDRA_HOME/support/analyzeHeadless" "$GHIDRA_HOME/support/launch.properties" || true
+          mkdir -p out/ghidra proj
+          "$GHIDRA_HOME/support/analyzeHeadless" proj mc \
+            -import libminecraftpe.so -overwrite \
+            -analysisTimeoutPerFile 10800 \
+            -scriptPath "$PWD/ghidra_scripts" \
+            -preScript ConfigureAnalysis.java \
+            -postScript FindTargets.java "$PWD/out/ghidra" "$PWD/targets.txt" \
+            2>&1 | tee out/ghidra/headless.log
+
+      - name: Upload Ghidra results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghidra-results
+          path: out/ghidra
+          if-no-files-found: ignore
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## Library info'; echo '```'; cat out/strings/info.txt 2>/dev/null | head -40; echo '```'
+            echo '## Targets found'; echo '```'; head -n 80 out/ghidra/targets.tsv 2>/dev/null || echo "none yet (Ghidra step failed or timed out - see headless.log)"; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
