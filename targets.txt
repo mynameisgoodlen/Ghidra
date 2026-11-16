@@ -1,0 +1,7 @@
+# One substring per line. Ghidra finds every function that uses a string containing it.
+# Lines starting with # are ignored. Edit this file and push to re-run.
+_launchVisibilityRebuild
+scheduleChunkBuild
+scheduleChunkSort
+updatePerChunkFaceSortState
+_buildRenderChunks
