@@ -17,7 +17,10 @@ jobs:
 
       - name: Rebuild library from parts
         run: |
-          sudo apt-get install -y p7zip-full >/dev/null; 7z e -y parts/*.7z.001
+          sudo apt-get install -y p7zip-full >/dev/null
+          ls -la
+          first=$(ls *.7z.001 2>/dev/null | head -n 1)
+          7z e -y "$first"
           ls -la libminecraftpe.so
           file libminecraftpe.so
 
