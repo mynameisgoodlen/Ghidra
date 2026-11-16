@@ -5,13 +5,17 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: analyze
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   analyze:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -19,33 +23,47 @@ jobs:
         run: |
           sudo apt-get install -y p7zip-full >/dev/null
           ls -la
-          first=$(ls *.7z.001 2>/dev/null | head -n 1)
-          7z e -y "$first"
+          first=$(ls ./*.7z.001 parts/*.7z.001 2>/dev/null | head -n 1 || true)
+          if [ -n "$first" ]; then
+            7z e -y -o. "$first" >/dev/null
+          elif ls parts/part_* >/dev/null 2>&1; then
+            cat parts/part_* | xz -d > libminecraftpe.so
+          else
+            z=$(ls ./*.zip parts/*.zip 2>/dev/null | head -n 1 || true)
+            [ -n "$z" ] || { echo "No library parts found"; exit 1; }
+            unzip -o "$z" || { zip -s 0 "$z" --out joined.zip && unzip -o joined.zip; }
+          fi
+          found=$(find . -name libminecraftpe.so -not -path './libminecraftpe.so' | head -n 1 || true)
+          if [ -n "$found" ]; then mv "$found" ./libminecraftpe.so; fi
           ls -la libminecraftpe.so
           file libminecraftpe.so
+          sha=$(sha256sum libminecraftpe.so | cut -d' ' -f1)
+          echo "sha256: $sha"
+          if [ "$sha" = "629c94e3d8a67f6f6de8296e9ebe9739cddbe4adc7e64ff699f32b289c82685b" ]; then echo "MATCH: expected build"; else echo "MISMATCH: different build than expected"; fi
 
-      - name: Strings map (fast, always useful)
-        run: bash scripts/strings_map.sh libminecraftpe.so out/strings
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-      - name: Upload strings map
+      - name: Find code that uses the target strings
+        run: |
+          python -m pip install -q numpy
+          mkdir -p out/xref
+          { file libminecraftpe.so; readelf -n libminecraftpe.so | grep -i "build id"; } > out/xref/info.txt 2>&1 || true
+          python scripts/xref_scan.py libminecraftpe.so targets.tsv out/xref
+
+      - name: Upload xref results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: strings-map
-          path: out/strings
+          name: xref-results
+          path: out/xref
+          if-no-files-found: ignore
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '25'
-
-      - name: Add swap (Ghidra is memory hungry)
-        continue-on-error: true
-        run: |
-          sudo fallocate -l 8G /mnt/swapfile2
-          sudo chmod 600 /mnt/swapfile2
-          sudo mkswap /mnt/swapfile2
-          sudo swapon /mnt/swapfile2
-          free -h
 
       - name: Download latest Ghidra
         env:
@@ -56,21 +74,18 @@ jobs:
           unzip -q dl/ghidra_*.zip -d tools
           echo "GHIDRA_HOME=$(ls -d "$PWD"/tools/ghidra_*)" >> "$GITHUB_ENV"
 
-      - name: Ghidra headless analysis (can take hours)
+      - name: Ghidra decompile of the found functions (no full analysis)
         continue-on-error: true
         run: |
           for f in "$GHIDRA_HOME/support/analyzeHeadless" "$GHIDRA_HOME/support/launch.properties"; do
             sed -i -E 's/^(MAXMEM=).*/\15G/' "$f" || true
           done
-          grep -n "MAXMEM" "$GHIDRA_HOME/support/analyzeHeadless" "$GHIDRA_HOME/support/launch.properties" || true
           mkdir -p out/ghidra proj
           "$GHIDRA_HOME/support/analyzeHeadless" proj mc \
-            -import libminecraftpe.so -overwrite \
-            -analysisTimeoutPerFile 10800 \
+            -import libminecraftpe.so -overwrite -noanalysis \
             -scriptPath "$PWD/ghidra_scripts" \
-            -preScript ConfigureAnalysis.java \
-            -postScript FindTargets.java "$PWD/out/ghidra" "$PWD/targets.txt" \
-            2>&1 | tee out/ghidra/headless.log
+            -postScript DecompileCandidates.java "$PWD/out/ghidra" "$PWD/out/xref/candidates.tsv" \
+            2>&1 | grep -v "ELF Relocation" | tee out/ghidra/headless.log
 
       - name: Upload Ghidra results
         if: always()
@@ -84,6 +99,6 @@ jobs:
         if: always()
         run: |
           {
-            echo '## Library info'; echo '```'; cat out/strings/info.txt 2>/dev/null | head -40; echo '```'
-            echo '## Targets found'; echo '```'; head -n 80 out/ghidra/targets.tsv 2>/dev/null || echo "none yet (Ghidra step failed or timed out - see headless.log)"; echo '```'
+            echo '## xref summary'; echo '```'; cat out/xref/summary.txt 2>/dev/null || echo "scan did not run"; echo '```'
+            echo '## decompiled'; echo '```'; head -n 80 out/ghidra/decompiled_index.tsv 2>/dev/null || echo "none (see headless.log)"; echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
