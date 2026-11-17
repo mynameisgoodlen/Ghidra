@@ -15,7 +15,7 @@ Pass 2: "pointer cells" - 32-bit words in the file that equal S (relocated point
         data, or absolute literals).  Code is searched for PC-relative refs to the cell
         (GOT-style) and for direct `ldr rX,[pc,#..]` of the cell.
 
-Usage: xref_scan.py <lib.so> <targets.tsv> <outdir>
+Usage: xref_scan.py <lib.so> <targets.tsv> <outdir> [seg_len_hex]
 targets.tsv: "<vaddr hex>\t<name>" per line (vaddr == file offset in the first LOAD).
 """
 import os
@@ -106,32 +106,42 @@ def add_hw_thumb(rd):
 
 
 # ----------------------------------------------------------------------------- stage 2 checks
-def has_ldr_to(mode, P, A, hm, words, seg_len, back=0x1400, fwd=0x1400):
-    """Is there an ldr-literal instruction (near A) that loads the pool word at P?"""
-    lo, hi = max(0, A - back), min(seg_len - 8, A + fwd)
+LDR_ADD_MAX = 512     # max bytes between the ldr and the add that uses its register
+
+
+def ldr_feeds_add(mode, P, A, regs, hm, words):
+    """True if an ldr-literal that loads the pool word at P sits 0..LDR_ADD_MAX bytes
+    BEFORE the add at A and loads into a register the add really uses (register match)."""
+    lo = max(0, A - LDR_ADD_MAX)
     if mode == "T":
-        h = np.asarray(hm[lo // 2: hi // 2 + 2]).astype(np.int64)
         base = lo // 2
-        i16 = np.flatnonzero((h & 0xF800) == 0x4800)
+        h = np.asarray(hm[base: A // 2 + 1]).astype(np.int64)
+        i16 = np.flatnonzero((h[:-1] & 0xF800) == 0x4800)
         if len(i16):
-            lit = ((2 * (base + i16) + 4) & ~3) + (h[i16] & 0xFF) * 4
-            if (lit == P).any():
+            addr = 2 * (base + i16)
+            lit = ((addr + 4) & ~3) + (h[i16] & 0xFF) * 4
+            rt = (h[i16] >> 8) & 7
+            if ((lit == P) & (addr < A) & np.isin(rt, regs)).any():
                 return True
-        i32 = np.flatnonzero(((h[:-1] & 0xFF7F) == 0xF85F))
+        i32 = np.flatnonzero((h[:-1] & 0xFF7F) == 0xF85F)
         if len(i32):
+            addr = 2 * (base + i32)
             imm = h[i32 + 1] & 0xFFF
             up = (h[i32] >> 7) & 1
-            lit = ((2 * (base + i32) + 4) & ~3) + np.where(up == 1, imm, -imm)
-            if (lit == P).any():
+            lit = ((addr + 4) & ~3) + np.where(up == 1, imm, -imm)
+            rt = (h[i32 + 1] >> 12) & 0xF
+            if ((lit == P) & (addr < A) & np.isin(rt, regs)).any():
                 return True
         return False
-    w = np.asarray(words[lo // 4: hi // 4 + 1]).astype(np.int64)
     base = lo // 4
+    w = np.asarray(words[base: A // 4 + 1]).astype(np.int64)
     ii = np.flatnonzero((w & 0x0F7F0000) == 0x051F0000)
     if len(ii):
         x = w[ii]
-        lit = 4 * (base + ii) + 8 + np.where(((x >> 23) & 1) == 1, x & 0xFFF, -(x & 0xFFF))
-        return bool((lit == P).any())
+        addr = 4 * (base + ii)
+        lit = addr + 8 + np.where(((x >> 23) & 1) == 1, x & 0xFFF, -(x & 0xFFF))
+        rt = (x >> 12) & 0xF
+        return bool(((lit == P) & (addr < A) & np.isin(rt, regs)).any())
     return False
 
 
@@ -139,8 +149,9 @@ def check_literal(P, W, S_arr, hm, words, seg_len, out, label):
     """P: byte address of pool word, W: its value. Exact check against every target."""
     if len(P) == 0:
         return
-    for b in range(0, len(P), 20000):
-        p, w = P[b:b + 20000], W[b:b + 20000]
+    blk = max(64, 3000000 // max(1, len(S_arr)))
+    for b in range(0, len(P), blk):
+        p, w = P[b:b + blk], W[b:b + blk]
         # Thumb: S = W + A + 4
         A = (S_arr[None, :] - w[:, None] - 4) & MASK
         d = swrap(p[:, None] - A)
@@ -151,8 +162,9 @@ def check_literal(P, W, S_arr, hm, words, seg_len, out, label):
             hw = np.asarray(hm[a >> 1]).astype(np.int64)
             m = (hw & 0xFF78) == 0x4478
             pp = p[ri[m]]
-            for a_, s_, p_ in zip(a[m], S_arr[ci[m]], pp):
-                if has_ldr_to("T", int(p_), int(a_), hm, words, seg_len):
+            for a_, s_, p_, hw_ in zip(a[m], S_arr[ci[m]], pp, hw[m]):
+                rdn = int(((hw_ >> 7) & 1) << 3 | (hw_ & 7))
+                if ldr_feeds_add("T", int(p_), int(a_), [rdn], hm, words):
                     out.append(("T", int(a_), int(s_), label + "literal+add"))
         # ARM: S = W + A + 8
         A = (S_arr[None, :] - w[:, None] - 8) & MASK
@@ -164,8 +176,10 @@ def check_literal(P, W, S_arr, hm, words, seg_len, out, label):
             x = np.asarray(words[a >> 2]).astype(np.int64)
             m = ((x & 0x0FFF0FF0) == 0x008F0000) | ((x & 0x0FF00FFF) == 0x0080000F)
             pp = p[ri[m]]
-            for a_, s_, p_ in zip(a[m], S_arr[ci[m]], pp):
-                if has_ldr_to("A", int(p_), int(a_), hm, words, seg_len):
+            for a_, s_, p_, x_ in zip(a[m], S_arr[ci[m]], pp, x[m]):
+                x_ = int(x_)
+                regs = [x_ & 0xF] if (x_ & 0x0FFF0FF0) == 0x008F0000 else [(x_ >> 16) & 0xF]
+                if ldr_feeds_add("A", int(p_), int(a_), regs, hm, words):
                     out.append(("A", int(a_), int(s_), label + "literal+add"))
 
 
@@ -175,8 +189,9 @@ def check_movwt(mode, cand, S_arr, hm, words, seg_len, out, label):
     if len(c) == 0:
         return
     k = 4 if mode == "T" else 8
-    for b in range(0, len(c), 20000):
-        cc, ee, rr = c[b:b + 20000], end[b:b + 20000], rd[b:b + 20000]
+    blk = max(64, 3000000 // max(1, len(S_arr)))
+    for b in range(0, len(c), blk):
+        cc, ee, rr = c[b:b + blk], end[b:b + blk], rd[b:b + blk]
         A = (S_arr[None, :] - cc[:, None] - k) & MASK
         e = A - ee[:, None]
         step = 1 if mode == "T" else 3
@@ -364,7 +379,7 @@ def find_cells(path, loads, S_arr):
 
 
 # ----------------------------------------------------------------------------- function starts
-def thumb_starts(hm, site, back=0x6000, limit=3):
+def thumb_starts(hm, site, back=0x6000, limit=2):
     lo = max(0, (site - back) // 2)
     hi = site // 2
     h = np.asarray(hm[lo:hi + 2]).astype(np.int64)
@@ -374,7 +389,7 @@ def thumb_starts(hm, site, back=0x6000, limit=3):
     return [2 * (lo + int(i)) for i in idx[::-1][:limit]]
 
 
-def arm_starts(words, site, back=0x6000, limit=3):
+def arm_starts(words, site, back=0x6000, limit=2):
     lo = max(0, (site - back) // 4)
     hi = site // 4
     w = np.asarray(words[lo:hi + 1]).astype(np.int64)
@@ -384,6 +399,9 @@ def arm_starts(words, site, back=0x6000, limit=3):
 
 
 # ----------------------------------------------------------------------------- main
+STRUCT_BACK = 128      # references to (cell - k), k = 0..STRUCT_BACK step 4  (name pointer inside a static struct)
+
+
 def main():
     if len(sys.argv) < 4:
         print(__doc__)
@@ -399,54 +417,81 @@ def main():
     hm = np.memmap(lib, dtype="<u2", mode="r", shape=(seg_len // 2,))
     words = np.memmap(lib, dtype="<u4", mode="r", shape=(seg_len // 4,))
 
-    hits = []   # (mode, site, string, kind, via)
+    hits = []   # dicts: mode, site, s (string), kind, target (address the code computes), cell, k
     print("pass 1: direct pc-relative references to the strings ...")
-    for mode, site, s, kind in scan_pcrel(hm, words, S_arr, seg_len, ""):
-        hits.append((mode, site, s, kind, 0))
+    for mode, site, s_, kind in scan_pcrel(hm, words, S_arr, seg_len, ""):
+        hits.append(dict(mode=mode, site=site, s=s_, kind=kind, target=s_, cell=0, k=0))
 
-    print("pass 2: pointer cells ...")
+    print("pass 2: pointer cells and the structs that contain them ...")
     cells = find_cells(lib, loads, S_arr)
-    cell_to_s = {}
     cell_lines = []
-    for s, cl in sorted(cells.items()):
+    tmap = {}                   # computed address -> (string, cell, k)
+    for s_, cl in sorted(cells.items()):
         cell_lines.append("%08x %-55s cells(%d): %s" % (
-            s, targets.get(s, "?"), len(cl), " ".join("%x" % c for c in cl[:MAX_CELLS_PER_TARGET])))
+            s_, targets.get(s_, "?"), len(cl), " ".join("%x" % c for c in cl[:MAX_CELLS_PER_TARGET])))
         for c in cl[:MAX_CELLS_PER_TARGET]:
-            cell_to_s[c] = s
-    if cell_to_s:
-        carr = np.array(sorted(cell_to_s), dtype=np.int64)
-        for mode, site, c, kind in scan_pcrel(hm, words, carr, seg_len, "via-cell:"):
-            hits.append((mode, site, cell_to_s[c], kind, c))
+            for k in range(0, STRUCT_BACK + 4, 4):
+                t = c - k
+                if t > 0 and t not in tmap:
+                    tmap[t] = (s_, c, k)
+    if tmap:
+        tarr = np.array(sorted(tmap), dtype=np.int64)
+        for mode, site, t, kind in scan_pcrel(hm, words, tarr, seg_len, "via-cell:"):
+            s_, c, k = tmap[t]
+            hits.append(dict(mode=mode, site=site, s=s_, kind=kind, target=t, cell=c, k=k))
+        carr = np.array(sorted({c for (_, c, _k) in tmap.values()}), dtype=np.int64)
+        c2s = {c: s_ for (s_, c, _k) in tmap.values()}
         for mode, site, c, kind in scan_direct_ldr(hm, words, carr, seg_len, "via-cell:"):
-            hits.append((mode, site, cell_to_s[c], kind, c))
+            hits.append(dict(mode=mode, site=site, s=c2s[c], kind=kind, target=c, cell=c, k=0))
 
-    seen, uniq = set(), []
-    for mode, site, s, kind, via in sorted(hits, key=lambda r: (r[2], r[1])):
-        if (mode, site, s) in seen:
+    seen, uniq, cell_count = set(), [], {}
+    for h in sorted(hits, key=lambda r: (r["cell"] != 0, r["s"], r["k"], r["site"])):
+        key = (h["mode"], h["site"], h["s"])
+        if key in seen:
             continue
-        seen.add((mode, site, s))
-        uniq.append((mode, site, s, kind, via))
+        if h["cell"]:
+            cell_count[h["s"]] = cell_count.get(h["s"], 0) + 1
+            if cell_count[h["s"]] > 6:
+                continue
+        seen.add(key)
+        uniq.append(h)
 
     per = {}
+    starts_by_name = {}
     with open(os.path.join(outdir, "hits.tsv"), "w") as fh, \
          open(os.path.join(outdir, "candidates.tsv"), "w") as fc:
-        fh.write("mode\tsite\tstring\tname\tkind\tcell\n")
-        fc.write("name\tmode\tsite\tstart\tstring\n")
-        for mode, site, s, kind, via in uniq:
-            name = targets[s]
-            per[name] = per.get(name, 0) + 1
-            fh.write("%s\t0x%08x\t0x%08x\t%s\t%s\t%s\n" % (mode, site, s, name, kind, ("0x%x" % via) if via else "-"))
-            starts = thumb_starts(hm, site) if mode == "T" else arm_starts(words, site)
-            for st in starts:
-                fc.write("%s\t%s\t0x%08x\t0x%08x\t0x%08x\n" % (name, mode, site, st, s))
+        fh.write("mode\tsite\tstring\tname\tkind\ttarget\tcell\tk\n")
+        fc.write("name\tmode\tsite\tstart\tstring\ttarget\n")
+        for h in uniq:
+            name = targets[h["s"]]
+            per.setdefault(name, [0, 0])[1 if h["cell"] else 0] += 1
+            fh.write("%s\t0x%08x\t0x%08x\t%s\t%s\t0x%08x\t0x%x\t%d\n" % (
+                h["mode"], h["site"], h["s"], name, h["kind"], h["target"], h["cell"], h["k"]))
+            st = thumb_starts(hm, h["site"]) if h["mode"] == "T" else arm_starts(words, h["site"])
+            for i, a in enumerate(st):
+                fc.write("%s\t%s\t0x%08x\t0x%08x\t0x%08x\t0x%08x\n" % (
+                    name, h["mode"], h["site"], a, h["s"], h["target"]))
+            if st:
+                key = (st[0], h["mode"], "cell+%d" % h["k"] if h["cell"] else "direct")
+                starts_by_name.setdefault(name, {}).setdefault(key, 0)
+                starts_by_name[name][key] += 1
 
     with open(os.path.join(outdir, "cells.txt"), "w") as f:
         f.write("\n".join(cell_lines) + "\n")
     with open(os.path.join(outdir, "summary.txt"), "w") as fs:
-        fs.write("hits: %d   targets with hits: %d / %d   targets with data cells: %d\n" % (
-            len(uniq), len(per), len(targets), len(cells)))
+        fs.write("hits: %d   targets with direct hits: %d   with via-cell hits: %d   (of %d targets)\n" % (
+            len(uniq), sum(1 for v in per.values() if v[0]), sum(1 for v in per.values() if v[1]), len(targets)))
         for v in sorted(targets):
-            fs.write("%-8s %-60s hits=%d cells=%d\n" % ("%x" % v, targets[v], per.get(targets[v], 0), len(cells.get(v, []))))
+            n = targets[v]
+            d, c = per.get(n, [0, 0])
+            fs.write("%-8s %-58s direct=%d cell=%d cells=%d\n" % ("%x" % v, n, d, c, len(cells.get(v, []))))
+    # compact table: most likely function start per target (most sites first)
+    with open(os.path.join(outdir, "strong.tsv"), "w") as fs:
+        fs.write("name\tfunc_start\tmode\tvia\tsites\n")
+        for name in sorted(starts_by_name):
+            items = sorted(starts_by_name[name].items(), key=lambda kv: -kv[1])[:4]
+            for (st, mode, via), n in items:
+                fs.write("%s\t0x%08x\t%s\t%s\t%d\n" % (name, st, mode, via, n))
     print(open(os.path.join(outdir, "summary.txt")).read())
 
 
