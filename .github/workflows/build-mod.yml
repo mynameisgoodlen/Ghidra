@@ -1,0 +1,402 @@
+name: build-fpsboost
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-mod.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Write mod source
+        run: |
+          mkdir -p mod out
+          cat > mod/fpsboost.c <<'FPSBOOST_EOF'
+          /*
+           * FpsBoost 0.1 - LeviLauncher native mod (armeabi-v7a, Minecraft Bedrock 32-bit)
+           *
+           * Skips selected RenderDragon frame-builder passes by hooking the tiny
+           * FrameBuilder::insert<TDescription>() wrappers (found by reverse engineering).
+           * A hooked wrapper that returns immediately means that pass is never queued.
+           *
+           * Safety:
+           *   - Only runs on the exact libminecraftpe.so build it was made for (GNU build id).
+           *   - Every hook target is byte-checked against the wrapper signature before hooking.
+           *   - Only passes you enable are hooked.
+           *
+           * Settings: optional text file  FpsBoost.cfg  (lines like  particles=1 ), looked up in
+           *   /sdcard/Download, /storage/emulated/0/Download, /sdcard and the game's own files dir.
+           *   1 = skip (disable) that pass, 0 = leave it alone.
+           * Log: FpsBoost.log in the same places (first writable one) and logcat tag "FpsBoost".
+           */
+          #define _GNU_SOURCE
+          #include <android/log.h>
+          #include <dlfcn.h>
+          #include <link.h>
+          #include <pthread.h>
+          #include <stdarg.h>
+          #include <stdbool.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <time.h>
+          #include <unistd.h>
+
+          #define TAG "FpsBoost"
+          #define EXPORT __attribute__((visibility("default")))
+
+          /* ---- launcher preloader API (prototypes recovered from the launcher's debug info) ---- */
+          typedef void *PLFuncPtr;
+          #define PL_HOOK_PRIORITY_NORMAL 200
+          typedef int (*pl_hook_fn)(PLFuncPtr target, PLFuncPtr detour, PLFuncPtr *original, int priority);
+          typedef bool (*pl_unhook_fn)(PLFuncPtr target, PLFuncPtr detour);
+
+          /* ---- the exact game build this mod was made for ---- */
+          static const char *EXPECTED_BUILD_ID = "03222634f9e4c1c061146770baa6872988e0a0fc";
+
+          /* first 12 bytes of every insert<T>() wrapper: push {r4-r7,lr}; add r7,sp,#12; push.w r8; sub sp,#0x30; mov r5,r0 */
+          static const uint8_t WRAPPER_PREFIX[12] = {0xF0, 0xB5, 0x03, 0xAF, 0x4D, 0xF8, 0x04, 0x8D, 0x8C, 0xB0, 0x05, 0x46};
+
+          typedef void (*wrapper_fn)(void *self, const void *desc);
+
+          typedef struct {
+              const char *key;      /* config key */
+              const char *what;     /* description for the log */
+              uint32_t rva;         /* address inside libminecraftpe.so (Thumb function, bit0 added when hooking) */
+              int skip;             /* 1 = skip this pass */
+              PLFuncPtr detour;
+              wrapper_fn *orig;
+              volatile int calls;
+              int hooked;
+          } Hook;
+
+          enum { H_PARTICLES, H_FLIPBOOK, H_CELESTIAL, H_ENDSKY, H_HAND, H_ENTITIES, H_AIMASSIST, H_COUNT };
+
+          static void det_particles(void *, const void *);
+          static void det_flipbook(void *, const void *);
+          static void det_celestial(void *, const void *);
+          static void det_endsky(void *, const void *);
+          static void det_hand(void *, const void *);
+          static void det_entities(void *, const void *);
+          static void det_aimassist(void *, const void *);
+          static wrapper_fn orig_particles, orig_flipbook, orig_celestial, orig_endsky, orig_hand, orig_entities, orig_aimassist;
+
+          static Hook g_hooks[H_COUNT] = {
+              [H_PARTICLES] = {"particles", "RenderParticleDescription (particles)", 0x06e57b44, 1, (PLFuncPtr)det_particles, &orig_particles, 0, 0},
+              [H_FLIPBOOK]  = {"flipbook", "BlitFlipbookTextureDescription (animated textures)", 0x073dff04, 0, (PLFuncPtr)det_flipbook, &orig_flipbook, 0, 0},
+              [H_CELESTIAL] = {"celestial", "RenderCelestialBodyDescription (sun/moon)", 0x073bbad8, 0, (PLFuncPtr)det_celestial, &orig_celestial, 0, 0},
+              [H_ENDSKY]    = {"endsky", "RenderEndSkyDescription (End sky)", 0x073bb8a0, 0, (PLFuncPtr)det_endsky, &orig_endsky, 0, 0},
+              [H_HAND]      = {"hand", "RenderItemInHandDescription (first-person hand/item)", 0x07404390, 0, (PLFuncPtr)det_hand, &orig_hand, 0, 0},
+              [H_ENTITIES]  = {"entities", "RenderBatchActorDescription (batched entities - they become invisible!)", 0x06a490ec, 0, (PLFuncPtr)det_entities, &orig_entities, 0, 0},
+              [H_AIMASSIST] = {"aimassist", "RenderCameraAimAssistHighlightDescription", 0x073bbccc, 0, (PLFuncPtr)det_aimassist, &orig_aimassist, 0, 0},
+          };
+
+          static volatile int g_active = 1;
+          static int g_state = 0; /* 0 = not tried, 1 = done (hooks installed or gave up for good) */
+          static pl_hook_fn g_pl_hook;
+          static pl_unhook_fn g_pl_unhook;
+          static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+          static char g_pkg[128];
+
+          /* ------------------------------------------------------------------ logging */
+          static const char *LOG_DIRS[] = {"/sdcard/Download", "/storage/emulated/0/Download", "/sdcard", NULL};
+
+          static void load_pkg(void) {
+              if (g_pkg[0]) return;
+              FILE *f = fopen("/proc/self/cmdline", "r");
+              if (!f) return;
+              size_t n = fread(g_pkg, 1, sizeof(g_pkg) - 1, f);
+              g_pkg[n] = 0;
+              fclose(f);
+          }
+
+          static void flog(const char *fmt, ...) {
+              char msg[600];
+              va_list ap;
+              va_start(ap, fmt);
+              vsnprintf(msg, sizeof(msg), fmt, ap);
+              va_end(ap);
+              __android_log_write(ANDROID_LOG_INFO, TAG, msg);
+
+              load_pkg();
+              char path[300];
+              FILE *f = NULL;
+              for (int i = 0; LOG_DIRS[i] && !f; i++) {
+                  snprintf(path, sizeof(path), "%s/FpsBoost.log", LOG_DIRS[i]);
+                  f = fopen(path, "a");
+              }
+              if (!f && g_pkg[0]) {
+                  snprintf(path, sizeof(path), "/sdcard/Android/data/%s/files/FpsBoost.log", g_pkg);
+                  f = fopen(path, "a");
+              }
+              if (f) {
+                  time_t t = time(NULL);
+                  struct tm tmv;
+                  localtime_r(&t, &tmv);
+                  fprintf(f, "[%02d:%02d:%02d] %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, msg);
+                  fclose(f);
+              }
+          }
+
+          /* ------------------------------------------------------------------ detours */
+          #define DEFINE_DETOUR(NAME, IDX)                                                   \
+              static void det_##NAME(void *self, const void *desc) {                         \
+                  if (__sync_fetch_and_add(&g_hooks[IDX].calls, 1) == 0)                     \
+                      flog("hook active, first call: %s", g_hooks[IDX].key);                 \
+                  if (g_active && g_hooks[IDX].skip) return;                                 \
+                  if (orig_##NAME) orig_##NAME(self, desc);                                  \
+              }
+
+          DEFINE_DETOUR(particles, H_PARTICLES)
+          DEFINE_DETOUR(flipbook, H_FLIPBOOK)
+          DEFINE_DETOUR(celestial, H_CELESTIAL)
+          DEFINE_DETOUR(endsky, H_ENDSKY)
+          DEFINE_DETOUR(hand, H_HAND)
+          DEFINE_DETOUR(entities, H_ENTITIES)
+          DEFINE_DETOUR(aimassist, H_AIMASSIST)
+
+          /* ------------------------------------------------------------------ config */
+          static void apply_config_line(char *line) {
+              char *hash = strchr(line, '#');
+              if (hash) *hash = 0;
+              char *eq = strchr(line, '=');
+              if (!eq) return;
+              *eq = 0;
+              char *k = line, *v = eq + 1;
+              while (*k == ' ' || *k == '\t') k++;
+              char *e = k + strlen(k);
+              while (e > k && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = 0;
+              while (*v == ' ' || *v == '\t') v++;
+              int val = atoi(v);
+              for (int i = 0; i < H_COUNT; i++) {
+                  if (strcmp(k, g_hooks[i].key) == 0) {
+                      g_hooks[i].skip = val ? 1 : 0;
+                      return;
+                  }
+              }
+          }
+
+          static void load_config(void) {
+              load_pkg();
+              char path[300];
+              FILE *f = NULL;
+              for (int i = 0; LOG_DIRS[i] && !f; i++) {
+                  snprintf(path, sizeof(path), "%s/FpsBoost.cfg", LOG_DIRS[i]);
+                  f = fopen(path, "r");
+              }
+              if (!f && g_pkg[0]) {
+                  snprintf(path, sizeof(path), "/sdcard/Android/data/%s/files/FpsBoost.cfg", g_pkg);
+                  f = fopen(path, "r");
+              }
+              if (!f) {
+                  flog("no FpsBoost.cfg found, using defaults (particles=1, everything else 0)");
+                  return;
+              }
+              flog("config: %s", path);
+              char line[200];
+              while (fgets(line, sizeof(line), f)) apply_config_line(line);
+              fclose(f);
+          }
+
+          /* ------------------------------------------------------------------ game module */
+          typedef struct {
+              bool found;
+              uintptr_t base;
+              char name[256];
+              char build_id[96];
+          } ModInfo;
+
+          static int phdr_cb(struct dl_phdr_info *info, size_t sz, void *data) {
+              (void)sz;
+              ModInfo *m = (ModInfo *)data;
+              if (!info->dlpi_name || !strstr(info->dlpi_name, "libminecraftpe.so")) return 0;
+              m->found = true;
+              m->base = (uintptr_t)info->dlpi_addr;
+              snprintf(m->name, sizeof(m->name), "%s", info->dlpi_name);
+              for (int i = 0; i < info->dlpi_phnum; i++) {
+                  const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+                  if (ph->p_type != PT_NOTE || ph->p_memsz == 0 || ph->p_memsz > 4096) continue;
+                  const uint8_t *p = (const uint8_t *)(info->dlpi_addr + ph->p_vaddr);
+                  size_t off = 0, len = ph->p_memsz;
+                  while (off + 12 <= len) {
+                      uint32_t namesz = *(const uint32_t *)(p + off);
+                      uint32_t descsz = *(const uint32_t *)(p + off + 4);
+                      uint32_t type = *(const uint32_t *)(p + off + 8);
+                      size_t noff = off + 12;
+                      size_t doff = noff + ((namesz + 3u) & ~3u);
+                      size_t next = doff + ((descsz + 3u) & ~3u);
+                      if (next > len) break;
+                      if (type == 3 && namesz == 4 && memcmp(p + noff, "GNU", 4) == 0 && descsz * 2 + 1 < sizeof(m->build_id)) {
+                          for (uint32_t j = 0; j < descsz; j++) snprintf(m->build_id + j * 2, 3, "%02x", p[doff + j]);
+                      }
+                      off = next;
+                  }
+              }
+              return 1;
+          }
+
+          static void resolve_preloader(void) {
+              g_pl_hook = (pl_hook_fn)dlsym(RTLD_DEFAULT, "pl_hook");
+              g_pl_unhook = (pl_unhook_fn)dlsym(RTLD_DEFAULT, "pl_unhook");
+              if (g_pl_hook) return;
+              void *h = dlopen("libpreloader.so", RTLD_NOW | RTLD_NOLOAD);
+              if (!h) {
+                  FILE *f = fopen("/proc/self/maps", "r");
+                  char line[512];
+                  while (f && fgets(line, sizeof(line), f)) {
+                      char *p = strstr(line, "libpreloader.so");
+                      if (!p) continue;
+                      char *start = strchr(line, '/');
+                      char *nl = strchr(line, '\n');
+                      if (start && nl) {
+                          *nl = 0;
+                          h = dlopen(start, RTLD_NOW | RTLD_NOLOAD);
+                          if (h) break;
+                      }
+                  }
+                  if (f) fclose(f);
+              }
+              if (h) {
+                  g_pl_hook = (pl_hook_fn)dlsym(h, "pl_hook");
+                  g_pl_unhook = (pl_unhook_fn)dlsym(h, "pl_unhook");
+              }
+          }
+
+          /* returns 1 when finished (installed or gave up for good), 0 when the game library is not loaded yet */
+          static int try_install(void) {
+              pthread_mutex_lock(&g_lock);
+              if (g_state) {
+                  pthread_mutex_unlock(&g_lock);
+                  return 1;
+              }
+              ModInfo m;
+              memset(&m, 0, sizeof(m));
+              dl_iterate_phdr(phdr_cb, &m);
+              if (!m.found) {
+                  pthread_mutex_unlock(&g_lock);
+                  return 0;
+              }
+              g_state = 1;
+              flog("FpsBoost 0.1: game module %s base=0x%08lx build-id=%s", m.name, (unsigned long)m.base,
+                   m.build_id[0] ? m.build_id : "(unreadable)");
+              if (m.build_id[0] && strcmp(m.build_id, EXPECTED_BUILD_ID) != 0) {
+                  flog("UNSUPPORTED game build (expected %s). Nothing was hooked.", EXPECTED_BUILD_ID);
+                  pthread_mutex_unlock(&g_lock);
+                  return 1;
+              }
+              resolve_preloader();
+              if (!g_pl_hook) {
+                  flog("pl_hook not found in this process - cannot install hooks.");
+                  pthread_mutex_unlock(&g_lock);
+                  return 1;
+              }
+              load_config();
+              int ok = 0, want = 0;
+              for (int i = 0; i < H_COUNT; i++) {
+                  Hook *h = &g_hooks[i];
+                  if (!h->skip) continue;
+                  want++;
+                  const uint8_t *code = (const uint8_t *)(m.base + h->rva);
+                  if (memcmp(code, WRAPPER_PREFIX, sizeof(WRAPPER_PREFIX)) != 0) {
+                      flog("SKIPPED %s: bytes at 0x%08x do not match the wrapper signature", h->key, h->rva);
+                      continue;
+                  }
+                  PLFuncPtr target = (PLFuncPtr)(m.base + h->rva + 1u); /* +1 = Thumb */
+                  int r = g_pl_hook(target, h->detour, (PLFuncPtr *)h->orig, PL_HOOK_PRIORITY_NORMAL);
+                  flog("hook %-9s target=%p ret=%d orig=%p  [%s]", h->key, target, r, (void *)*h->orig, h->what);
+                  h->hooked = 1;
+                  ok++;
+              }
+              flog("done: %d of %d requested hooks installed", ok, want);
+              pthread_mutex_unlock(&g_lock);
+              return 1;
+          }
+
+          static void *wait_thread(void *arg) {
+              (void)arg;
+              for (int i = 0; i < 480; i++) { /* up to ~2 minutes */
+                  if (try_install()) return NULL;
+                  usleep(250000);
+              }
+              flog("game library never appeared, giving up");
+              return NULL;
+          }
+
+          static void start(void) {
+              if (try_install()) return;
+              pthread_t t;
+              if (pthread_create(&t, NULL, wait_thread, NULL) == 0) pthread_detach(t);
+          }
+
+          /* ------------------------------------------------------------------ launcher lifecycle */
+          EXPORT bool PLMod_Load(void) {
+              g_active = 1;
+              start();
+              return true;
+          }
+          EXPORT bool PLMod_Enable(void) {
+              g_active = 1;
+              start();
+              return true;
+          }
+          EXPORT bool PLMod_Disable(void) {
+              g_active = 0;
+              return true;
+          }
+          EXPORT bool PLMod_Unload(void) {
+              g_active = 0;
+              (void)g_pl_unhook;
+              return true;
+          }
+          /* legacy entry name some launcher builds look for */
+          EXPORT void LeviMod_Load(void) {
+              g_active = 1;
+              start();
+          }
+          FPSBOOST_EOF
+          cat > out/FpsBoost.cfg <<'CFG_EOF'
+          # FpsBoost settings: 1 = skip (disable) that pass, 0 = leave it alone
+          # Put this file in /sdcard/Download (or /sdcard) and restart the game.
+          particles=1     # all particles (safe)
+          flipbook=0      # animated textures (water/lava/fire frames freeze)
+          celestial=0     # sun and moon
+          endsky=0        # End dimension sky
+          hand=0          # first-person hand / held item
+          entities=0      # batched entities: mobs become INVISIBLE (benchmark only!)
+          aimassist=0     # aim-assist highlight (harmless)
+          CFG_EOF
+          wc -l mod/fpsboost.c
+
+      - name: Build libfpsboost.so (armeabi-v7a, Android NDK)
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            NDK="$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -n 1)"
+          fi
+          echo "NDK: $NDK"
+          [ -d "$NDK" ] || { echo "Android NDK not found on this runner"; exit 1; }
+          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang"
+          "$CC" --version | head -n 1
+          "$CC" -shared -fPIC -O2 -Wall -Wextra -std=gnu11 -fvisibility=hidden \
+            -Wl,--build-id -Wl,-z,noexecstack \
+            -o out/libfpsboost.so mod/fpsboost.c -llog -ldl
+          ls -la out
+          file out/libfpsboost.so
+          readelf -h out/libfpsboost.so | grep -E "Class|Machine"
+          echo "--- needed libraries:"; readelf -d out/libfpsboost.so | grep NEEDED
+          echo "--- exported lifecycle symbols:"
+          readelf -W --dyn-syms out/libfpsboost.so | grep -E "PLMod_|LeviMod_"
+          readelf -W --dyn-syms out/libfpsboost.so | grep -q PLMod_Load || { echo "PLMod_Load not exported"; exit 1; }
+
+      - name: Upload mod
+        uses: actions/upload-artifact@v4
+        with:
+          name: FpsBoost-armeabi-v7a
+          path: out
