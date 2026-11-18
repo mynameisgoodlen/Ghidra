@@ -19,7 +19,7 @@ jobs:
           mkdir -p mod out
           cat > mod/fpsboost.c <<'FPSBOOST_EOF'
           /*
-           * FpsBoost 0.1 - LeviLauncher native mod (armeabi-v7a, Minecraft Bedrock 32-bit)
+           * FpsBoost 0.2 - LeviLauncher native mod (armeabi-v7a, Minecraft Bedrock 32-bit)
            *
            * Skips selected RenderDragon frame-builder passes by hooking the tiny
            * FrameBuilder::insert<TDescription>() wrappers (found by reverse engineering).
@@ -29,6 +29,9 @@ jobs:
            *   - Only runs on the exact libminecraftpe.so build it was made for (GNU build id).
            *   - Every hook target is byte-checked against the wrapper signature before hooking.
            *   - Only passes you enable are hooked.
+           *
+           * v0.2 adds a GLES layer that does not depend on the game build: unlock VSync, optional frame cap,
+           * and an FPS logger (average FPS + worst frame time every 5 s).
            *
            * Settings: optional text file  FpsBoost.cfg  (lines like  particles=1 ), looked up in
            *   /sdcard/Download, /storage/emulated/0/Download, /sdcard and the game's own files dir.
@@ -105,6 +108,18 @@ jobs:
           static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
           static char g_pkg[128];
 
+          /* GLES layer settings (config keys: vsync_off, fps_cap, fps_log) */
+          static int g_vsync_off = 1;
+          static int g_fps_cap = 0;   /* 0 = unlimited */
+          static int g_fps_log = 1;
+          static unsigned g_log_interval_ms = 5000;
+          typedef unsigned int (*egl_swap_fn)(void *dpy, void *surf);
+          typedef unsigned int (*egl_interval_fn)(void *dpy, int interval);
+          static egl_swap_fn orig_swap;
+          static egl_interval_fn p_swap_interval;
+          static int g_gl_done;
+          static int g_cfg_loaded;
+
           /* ------------------------------------------------------------------ logging */
           static const char *LOG_DIRS[] = {"/sdcard/Download", "/storage/emulated/0/Download", "/sdcard", NULL};
 
@@ -175,6 +190,9 @@ jobs:
               while (e > k && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = 0;
               while (*v == ' ' || *v == '\t') v++;
               int val = atoi(v);
+              if (strcmp(k, "vsync_off") == 0) { g_vsync_off = val ? 1 : 0; return; }
+              if (strcmp(k, "fps_cap") == 0) { g_fps_cap = val < 0 ? 0 : (val > 1000 ? 1000 : val); return; }
+              if (strcmp(k, "fps_log") == 0) { g_fps_log = val ? 1 : 0; return; }
               for (int i = 0; i < H_COUNT; i++) {
                   if (strcmp(k, g_hooks[i].key) == 0) {
                       g_hooks[i].skip = val ? 1 : 0;
@@ -196,13 +214,19 @@ jobs:
                   f = fopen(path, "r");
               }
               if (!f) {
-                  flog("no FpsBoost.cfg found, using defaults (particles=1, everything else 0)");
+                  flog("no FpsBoost.cfg found, using defaults (particles=1, vsync_off=1, fps_log=1, everything else 0)");
                   return;
               }
               flog("config: %s", path);
               char line[200];
               while (fgets(line, sizeof(line), f)) apply_config_line(line);
               fclose(f);
+          }
+
+          static void ensure_config(void) {
+              if (g_cfg_loaded) return;
+              g_cfg_loaded = 1;
+              load_config();
           }
 
           /* ------------------------------------------------------------------ game module */
@@ -284,7 +308,7 @@ jobs:
                   return 0;
               }
               g_state = 1;
-              flog("FpsBoost 0.1: game module %s base=0x%08lx build-id=%s", m.name, (unsigned long)m.base,
+              flog("FpsBoost 0.2: game module %s base=0x%08lx build-id=%s", m.name, (unsigned long)m.base,
                    m.build_id[0] ? m.build_id : "(unreadable)");
               if (m.build_id[0] && strcmp(m.build_id, EXPECTED_BUILD_ID) != 0) {
                   flog("UNSUPPORTED game build (expected %s). Nothing was hooked.", EXPECTED_BUILD_ID);
@@ -297,7 +321,7 @@ jobs:
                   pthread_mutex_unlock(&g_lock);
                   return 1;
               }
-              load_config();
+              ensure_config();
               int ok = 0, want = 0;
               for (int i = 0; i < H_COUNT; i++) {
                   Hook *h = &g_hooks[i];
@@ -319,6 +343,88 @@ jobs:
               return 1;
           }
 
+
+          /* ------------------------------------------------------------------ GLES layer (build independent) */
+          static uint64_t now_ns(void) {
+              struct timespec ts;
+              clock_gettime(CLOCK_MONOTONIC, &ts);
+              return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+          }
+
+          static struct {
+              uint64_t last;      /* time of the previous swap (for FPS statistics) */
+              uint64_t resume;    /* time the previous frame finished, after any cap sleep (for the cap) */
+              uint64_t win_start, worst;
+              unsigned frames;
+              unsigned long total;
+          } g_fs;
+
+          static unsigned int det_swap(void *dpy, void *surf) {
+              unsigned long n = ++g_fs.total;
+              if (g_vsync_off && p_swap_interval && (n == 1 || n % 90 == 0)) p_swap_interval(dpy, 0);
+              unsigned int r = orig_swap ? orig_swap(dpy, surf) : 1u;
+              if (!g_active) return r;
+
+              uint64_t t = now_ns();
+              if (g_fs.last) {
+                  uint64_t d = t - g_fs.last;              /* full swap-to-swap interval */
+                  if (d > g_fs.worst) g_fs.worst = d;
+                  g_fs.frames++;
+              } else {
+                  g_fs.win_start = t;
+                  g_fs.resume = t;
+              }
+              g_fs.last = t;
+              if (g_fps_log && g_fs.frames && t - g_fs.win_start >= (uint64_t)g_log_interval_ms * 1000000ull) {
+                  double secs = (double)(t - g_fs.win_start) / 1e9;
+                  flog("fps avg %.1f  worst frame %.1f ms  (vsync_off=%d cap=%d)", g_fs.frames / secs,
+                       (double)g_fs.worst / 1e6, g_vsync_off, g_fps_cap);
+                  g_fs.win_start = t;
+                  g_fs.frames = 0;
+                  g_fs.worst = 0;
+              }
+              if (g_fps_cap > 0) {
+                  uint64_t target = 1000000000ull / (uint64_t)g_fps_cap;
+                  uint64_t work = t - g_fs.resume;         /* time spent producing this frame, without our sleep */
+                  if (work < target) {
+                      struct timespec ts;
+                      uint64_t sleep_ns = target - work;
+                      ts.tv_sec = (time_t)(sleep_ns / 1000000000ull);
+                      ts.tv_nsec = (long)(sleep_ns % 1000000000ull);
+                      nanosleep(&ts, NULL);
+                  }
+              }
+              g_fs.resume = now_ns();
+              return r;
+          }
+
+          static void install_gl(void) {
+              pthread_mutex_lock(&g_lock);
+              if (g_gl_done) {
+                  pthread_mutex_unlock(&g_lock);
+                  return;
+              }
+              g_gl_done = 1;
+              ensure_config();
+              if (!g_vsync_off && g_fps_cap <= 0 && !g_fps_log) {
+                  flog("GLES layer: all options off, not hooking eglSwapBuffers");
+                  pthread_mutex_unlock(&g_lock);
+                  return;
+              }
+              if (!g_pl_hook) resolve_preloader();
+              void *swap = dlsym(RTLD_DEFAULT, "eglSwapBuffers");
+              p_swap_interval = (egl_interval_fn)dlsym(RTLD_DEFAULT, "eglSwapInterval");
+              if (!g_pl_hook || !swap) {
+                  flog("GLES layer: cannot hook (pl_hook=%p eglSwapBuffers=%p)", (void *)g_pl_hook, swap);
+                  pthread_mutex_unlock(&g_lock);
+                  return;
+              }
+              int r = g_pl_hook((PLFuncPtr)swap, (PLFuncPtr)det_swap, (PLFuncPtr *)&orig_swap, PL_HOOK_PRIORITY_NORMAL);
+              flog("GLES layer: hook eglSwapBuffers ret=%d orig=%p  vsync_off=%d fps_cap=%d fps_log=%d", r,
+                   (void *)orig_swap, g_vsync_off, g_fps_cap, g_fps_log);
+              pthread_mutex_unlock(&g_lock);
+          }
+
           static void *wait_thread(void *arg) {
               (void)arg;
               for (int i = 0; i < 480; i++) { /* up to ~2 minutes */
@@ -330,6 +436,7 @@ jobs:
           }
 
           static void start(void) {
+              install_gl();
               if (try_install()) return;
               pthread_t t;
               if (pthread_create(&t, NULL, wait_thread, NULL) == 0) pthread_detach(t);
@@ -362,8 +469,8 @@ jobs:
           }
           FPSBOOST_EOF
           cat > out/FpsBoost.cfg <<'CFG_EOF'
-          # FpsBoost settings: 1 = skip (disable) that pass, 0 = leave it alone
-          # Put this file in /sdcard/Download (or /sdcard) and restart the game.
+          # FpsBoost settings. Put this file in /sdcard/Download (or /sdcard) and restart the game.
+          # --- render passes: 1 = skip (disable) that pass, 0 = leave it alone
           particles=1     # all particles (safe)
           flipbook=0      # animated textures (water/lava/fire frames freeze)
           celestial=0     # sun and moon
@@ -371,6 +478,10 @@ jobs:
           hand=0          # first-person hand / held item
           entities=0      # batched entities: mobs become INVISIBLE (benchmark only!)
           aimassist=0     # aim-assist highlight (harmless)
+          # --- GLES layer (works on any game build)
+          vsync_off=1     # 1 = turn VSync off so FPS no longer snaps to 30/60
+          fps_cap=0       # 0 = unlimited, or e.g. 60 to cap the frame rate (less heat)
+          fps_log=1       # write average FPS + worst frame time to FpsBoost.log every 5 s
           CFG_EOF
           wc -l mod/fpsboost.c
 
