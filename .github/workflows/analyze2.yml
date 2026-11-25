@@ -1,0 +1,457 @@
+name: mcre-analyze-2
+
+# Manual run only (Actions -> mcre-analyze-2 -> Run workflow).
+# Round 2: who calls the chunk-build functions + the small helper functions behind the
+# entity-render callback. Same library lookup as round 1.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 170
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write analysis files
+        run: |
+          mkdir -p work out
+          cat > work/callers.py <<'MCRE_EOF'
+          #!/usr/bin/env python3
+          """
+          callers.py <lib.so> <outdir>
+
+          Finds the code that CALLS a list of known Thumb functions (BL and B.W branches), so the
+          callers can be decompiled and the argument / return conventions read from real call sites.
+          Outputs: callers.txt (readable), callers_candidates.tsv (for DecompileCandidates.java).
+          """
+          import os
+          import re
+          import struct
+          import sys
+
+          import numpy as np
+
+          # name, file offset of the function (even address)
+          TARGETS = [
+              ("scheduleChunkBuild",        0x074116d0),
+              ("scheduleChunkSort",         0x07412de8),
+              ("startLevelBuild_A",         0x073fb76c),
+              ("startLevelBuild_B",         0x073febf8),
+              ("startLevelBuild_C",         0x0740e1f8),
+              ("launchVisibilityRebuild",   0x06969f00),
+              ("launchSubChunkInsert",      0x06f9137c),
+              ("updateFaceSortState",       0x073b7d0c),
+              ("LevelRendererCameraRender", 0x073bf4b4),
+              ("qreFuncA",                  0x073f55a8),   # std::function builders next to queueRenderEntities
+              ("qreFuncB",                  0x073f55e0),
+              ("qreFuncC",                  0x073f5618),
+              ("qreFuncD",                  0x073f57b4),
+          ]
+          MAX_SITES_LISTED = 25
+          MAX_ROWS = 45
+          ROWS_PER_TARGET = 4
+
+
+          def read_loads(path):
+              with open(path, "rb") as f:
+                  eh = f.read(52)
+                  if eh[:4] != b"\x7fELF":
+                      return None
+                  phoff, = struct.unpack_from("<I", eh, 28)
+                  phentsize, phnum = struct.unpack_from("<HH", eh, 42)
+                  f.seek(phoff)
+                  loads = []
+                  for _ in range(phnum):
+                      ph = f.read(phentsize)
+                      p_type, p_off, p_va, _pa, p_fsz, _msz, _fl, _al = struct.unpack_from("<8I", ph, 0)
+                      if p_type == 1:
+                          loads.append((p_off, p_va, p_fsz))
+                  return loads
+
+
+          def first_load_len(path, loads):
+              if loads:
+                  for off, va, fsz in loads:
+                      if off == 0 and va == 0:
+                          return fsz
+              return os.path.getsize(path)
+
+
+          def thumb_starts(hm, site, back=0x6000, limit=2):
+              lo = max(0, (site - back) // 2)
+              hi = site // 2
+              h = np.asarray(hm[lo:hi + 2]).astype(np.int64)
+              c16 = (h[:-1] & 0xFF00) == 0xB500
+              c32 = (h[:-1] == 0xE92D) & ((h[1:] & 0x4000) != 0)
+              idx = np.flatnonzero((c16 | c32)[: hi - lo])
+              return [2 * (lo + int(i)) for i in idx[::-1][:limit]]
+
+
+          def scan_branches(hm, nh, targets):
+              """{target: [(site, 'BL'|'B.W')]} for every Thumb-2 BL / B.W whose destination is in targets."""
+              tarr = np.array(sorted(targets), dtype=np.int64)
+              out = {t: [] for t in targets}
+              CH = 1 << 23
+              for start in range(0, nh - 1, CH):
+                  end = min(nh, start + CH + 1)
+                  h = np.asarray(hm[start:end]).astype(np.int64)
+                  h1, h2 = h[:-1], h[1:]
+                  m = ((h1 & 0xF800) == 0xF000) & (((h2 & 0xD000) == 0xD000) | ((h2 & 0xD000) == 0x9000))
+                  idx = np.flatnonzero(m)
+                  if idx.size == 0:
+                      continue
+                  a, b = h1[idx], h2[idx]
+                  S = (a >> 10) & 1
+                  J1, J2 = (b >> 13) & 1, (b >> 11) & 1
+                  I1, I2 = 1 - (J1 ^ S), 1 - (J2 ^ S)
+                  imm = (S << 24) | (I1 << 23) | (I2 << 22) | ((a & 0x3FF) << 12) | ((b & 0x7FF) << 1)
+                  imm = imm - (S << 25)
+                  site = 2 * (start + idx)
+                  dest = site + 4 + imm
+                  for k in np.flatnonzero(np.isin(dest, tarr)):
+                      out[int(dest[k])].append((int(site[k]), "BL" if (int(b[k]) & 0x4000) else "B.W"))
+              return out
+
+
+          def main():
+              if len(sys.argv) < 3:
+                  print(__doc__)
+                  sys.exit(2)
+              lib, outdir = sys.argv[1], sys.argv[2]
+              os.makedirs(outdir, exist_ok=True)
+              seg = first_load_len(lib, read_loads(lib)) & ~3
+              hm = np.memmap(lib, dtype="<u2", mode="r", shape=(seg // 2,))
+              res = scan_branches(hm, seg // 2, {a for _, a in TARGETS})
+              rows, report = [], []
+              for name, addr in TARGETS:
+                  sites = sorted(res[addr])
+                  report.append("== %s  0x%08x  : %d call site(s)" % (name, addr, len(sites)))
+                  for site, kind in sites[:MAX_SITES_LISTED]:
+                      st = thumb_starts(hm, site)
+                      report.append("   %s at 0x%08x  -> caller start candidates: %s" % (
+                          kind, site, " ".join("0x%08x" % s for s in st)))
+                  taken = 0
+                  for site, kind in sorted(sites, key=lambda s: (s[1] != "BL", s[0])):
+                      if taken >= ROWS_PER_TARGET or len(rows) >= MAX_ROWS:
+                          break
+                      st = thumb_starts(hm, site)
+                      if st:
+                          rows.append("CALLER_%s_%d\tT\t0x%08x\t0x%08x\t0x%08x\t0x%08x" % (
+                              re.sub(r"[^A-Za-z0-9]", "", name)[:24], taken + 1, site, st[0], addr, addr))
+                          taken += 1
+                  report.append("")
+              with open(os.path.join(outdir, "callers.txt"), "w") as fh:
+                  fh.write("\n".join(report) + "\n")
+              with open(os.path.join(outdir, "callers_candidates.tsv"), "w") as fh:
+                  fh.write("name\tmode\tsite\tstart\tstring\ttarget\n" + "\n".join(rows) + ("\n" if rows else ""))
+              print("\n".join(l for l in report if l.startswith("==")))
+              print("caller rows for decompile: %d" % len(rows))
+
+
+          if __name__ == "__main__":
+              main()
+          MCRE_EOF
+          cat > work/DecompileCandidates.java <<'MCRE_EOF'
+          //Decompiles function-start candidates produced by xref_scan.py (no whole-program analysis).
+          //A result is CONFIRMED only if the decompiled code really contains the string's (or cell's) address.
+          //Args: <outDir> <candidates.tsv>
+          //@category MCRE
+
+          import java.io.File;
+          import java.io.FileWriter;
+          import java.io.PrintWriter;
+          import java.math.BigInteger;
+          import java.nio.file.Files;
+          import java.nio.file.Paths;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.Set;
+
+          import ghidra.app.decompiler.DecompInterface;
+          import ghidra.app.decompiler.DecompileOptions;
+          import ghidra.app.decompiler.DecompileResults;
+          import ghidra.app.script.GhidraScript;
+          import ghidra.program.model.address.Address;
+          import ghidra.program.model.lang.Register;
+          import ghidra.program.model.listing.Function;
+          import ghidra.program.model.listing.Instruction;
+          import ghidra.program.model.listing.InstructionIterator;
+          import ghidra.program.model.listing.ProgramContext;
+
+          public class DecompileCandidates extends GhidraScript {
+
+              private static final int MAX_C_LINES = 3000;
+              private static final int MAX_INSNS = 120;
+              private static final long TIME_BUDGET_MS = 50L * 60L * 1000L;
+              private static final int CLEAR_BEFORE = 0x40;
+              private static final int CLEAR_AFTER = 0x5000;
+
+              private void clearAround(Address start) throws Exception {
+                  // wipes any earlier (possibly misaligned) disassembly, functions and Thumb/ARM context here
+                  clearListing(start.subtract(CLEAR_BEFORE), start.add(CLEAR_AFTER));
+              }
+
+              @Override
+              public void run() throws Exception {
+                  String[] args = getScriptArgs();
+                  File outDir = new File(args[0]);
+                  outDir.mkdirs();
+
+                  List<String[]> rows = new ArrayList<>();
+                  boolean first = true;
+                  for (String line : Files.readAllLines(Paths.get(args[1]))) {
+                      if (first) { first = false; continue; }          // header
+                      if (line.trim().isEmpty()) continue;
+                      rows.add(line.split("\t"));                      // name mode site start string
+                  }
+                  println("candidates: " + rows.size());
+
+                  Address base = currentProgram.getImageBase();
+                  long baseOff = base.getOffset();
+                  ProgramContext ctx = currentProgram.getProgramContext();
+                  Register tmode = currentProgram.getRegister("TMode");
+
+                  DecompInterface di = new DecompInterface();
+                  di.setOptions(new DecompileOptions());
+                  di.openProgram(currentProgram);
+
+                  PrintWriter index = new PrintWriter(new FileWriter(new File(outDir, "decompiled_index.tsv")));
+                  index.println("name\tmode\tsite\tstart\tcontains_site\tconfirmed\tsize\tfile");
+
+                  Set<String> confirmedSites = new HashSet<>();
+                  Map<Long, String> textByStart = new HashMap<>();
+                  Map<Long, String> fileByStart = new HashMap<>();
+                  long t0 = System.currentTimeMillis();
+                  int written = 0;
+
+                  for (String[] r : rows) {
+                      if (monitor.isCancelled()) break;
+                      if (System.currentTimeMillis() - t0 > TIME_BUDGET_MS) { println("time budget reached"); break; }
+                      if (r.length < 5) continue;
+                      String name = r[0], mode = r[1];
+                      long siteV = Long.parseLong(r[2].replace("0x", ""), 16);
+                      long startV = Long.parseLong(r[3].replace("0x", ""), 16);
+                      long strV = Long.parseLong(r[4].replace("0x", ""), 16);
+
+                      String siteKey = name + "|" + siteV;
+                      if (confirmedSites.contains(siteKey)) continue;
+
+                      String probe = String.format("%08x", strV + baseOff);
+
+                      // function already decompiled for another target: just test this string against its text
+                      if (textByStart.containsKey(startV)) {
+                          boolean conf = textByStart.get(startV).contains(probe);
+                          index.printf("%s\t%s\t0x%08x\t0x%08x\ttrue\t%b\t-\t%s%n", name, mode, siteV, startV, conf,
+                                       fileByStart.get(startV));
+                          if (conf) confirmedSites.add(siteKey);
+                          continue;
+                      }
+
+                      Address startA = base.add(startV);
+                      Address siteA = base.add(siteV);
+                      try {
+                          clearAround(startA);
+                          if (tmode != null) {
+                              ctx.setValue(tmode, startA, startA, BigInteger.valueOf(mode.equals("T") ? 1 : 0));
+                          }
+                          disassemble(startA);
+                          Function f = getFunctionAt(startA);
+                          if (f == null) f = createFunction(startA, null);
+                          if (f == null) {
+                              index.printf("%s\t%s\t0x%08x\t0x%08x\tno_function\tfalse\t0\t-%n", name, mode, siteV, startV);
+                              continue;
+                          }
+                          boolean contains = f.getBody().contains(siteA);
+                          long size = f.getBody().getNumAddresses();
+                          if (!contains) {
+                              index.printf("%s\t%s\t0x%08x\t0x%08x\tfalse\tfalse\t%d\t-%n", name, mode, siteV, startV, size);
+                              continue;
+                          }
+
+                          String full = "";
+                          String errMsg = null;
+                          try {
+                              DecompileResults res = di.decompileFunction(f, 60, monitor);
+                              if (res != null && res.decompileCompleted()) {
+                                  full = res.getDecompiledFunction().getC();
+                              } else {
+                                  errMsg = (res == null ? "null" : res.getErrorMessage());
+                              }
+                          } catch (Exception ex) {
+                              errMsg = "decompile exception: " + ex.getMessage();
+                          }
+                          String lower = full.toLowerCase();
+                          boolean confirmed = lower.contains(probe);
+
+                          String safe = name.replaceAll("[^A-Za-z0-9_]+", "_");
+                          String fname = String.format("dec_%s_%08x%s.txt", safe, startV, confirmed ? "" : "_unconfirmed");
+                          textByStart.put(startV, lower);
+                          fileByStart.put(startV, fname);
+                          index.printf("%s\t%s\t0x%08x\t0x%08x\ttrue\t%b\t%d\t%s%n", name, mode, siteV, startV, confirmed, size, fname);
+                          if (confirmed) confirmedSites.add(siteKey);
+
+                          PrintWriter w = new PrintWriter(new FileWriter(new File(outDir, fname)));
+                          w.printf("target: %s%n", name);
+                          w.printf("confirmed (decompile contains string address 0x%s): %b%n", probe, confirmed);
+                          w.printf("mode: %s (T = Thumb: hook address must have bit0 set)   start: 0x%08x   hook_addr: 0x%08x   size: %d%n",
+                                   mode, startV, mode.equals("T") ? (startV | 1) : startV, size);
+                          w.printf("string reference at: 0x%08x   string: %s%n", siteV, r[4]);
+                          try {
+                              byte[] b = new byte[64];
+                              int got = currentProgram.getMemory().getBytes(startA, b);
+                              StringBuilder sb = new StringBuilder();
+                              for (int i = 0; i < got; i++) sb.append(String.format("%02X ", b[i]));
+                              w.println("first bytes: " + sb.toString().trim());
+                          } catch (Exception ex) {
+                              w.println("bytes failed: " + ex.getMessage());
+                          }
+                          w.println();
+                          w.println("---- first instructions (addresses shown as file offsets) ----");
+                          InstructionIterator it = currentProgram.getListing().getInstructions(f.getBody(), true);
+                          int n = 0;
+                          while (it.hasNext() && n++ < MAX_INSNS) {
+                              Instruction ins = it.next();
+                              w.printf("%08x: %s%n", ins.getAddress().subtract(base), ins.toString());
+                          }
+                          w.println();
+                          w.println("---- decompiled (Ghidra addresses = file offset + 0x" + Long.toHexString(baseOff) + ") ----");
+                          if (errMsg != null) {
+                              w.println("decompile failed: " + errMsg);
+                          } else {
+                              String[] lines = full.split("\n");
+                              for (int i = 0; i < lines.length && i < MAX_C_LINES; i++) w.println(lines[i]);
+                              if (lines.length > MAX_C_LINES) w.println("... (" + (lines.length - MAX_C_LINES) + " more lines)");
+                          }
+                          w.close();
+                          written++;
+                          println((confirmed ? "CONFIRMED: " : "unconfirmed: ") + name + " @ 0x" + Long.toHexString(startV));
+                      } catch (Exception ex) {
+                          index.printf("%s\t%s\t0x%08x\t0x%08x\terror\tfalse\t0\t%s%n", name, mode, siteV, startV,
+                                       String.valueOf(ex.getMessage()).replace('\t', ' ').replace('\n', ' '));
+                      }
+                  }
+                  index.close();
+                  di.dispose();
+                  println("done, files written: " + written);
+              }
+          }
+          MCRE_EOF
+          cat > work/seeds2.psv <<'MCRE_EOF'
+          name|mode|site|start|string|target
+          HELP_actorPos|T|0x06787124|0x06787124|0x06787124|0x06787124
+          HELP_setDist|T|0x0678b864|0x0678b864|0x0678b864|0x0678b864
+          HELP_rendererFor|T|0x06a96634|0x06a96634|0x06a96634|0x06a96634
+          HELP_frustum|T|0x06791bd0|0x06791bd0|0x06791bd0|0x06791bd0
+          HELP_camQuick|T|0x073bc2bc|0x073bc2bc|0x073bc2bc|0x073bc2bc
+          HELP_visDecide|T|0x073c4b30|0x073c4b30|0x073c4b30|0x073c4b30
+          HELP_actorFlag1|T|0x06791e9c|0x06791e9c|0x06791e9c|0x06791e9c
+          HELP_actorFlag2|T|0x0678aac4|0x0678aac4|0x0678aac4|0x0678aac4
+          HELP_actorFlag3|T|0x0678b4f4|0x0678b4f4|0x0678b4f4|0x0678b4f4
+          HELP_actorFlag4|T|0x0678839c|0x0678839c|0x0678839c|0x0678839c
+          HELP_actorFlag5|T|0x0678ad70|0x0678ad70|0x0678ad70|0x0678ad70
+          HELP_chunkFromSh|T|0x0696dfd2|0x0696dfd2|0x0696dfd2|0x0696dfd2
+          HELP_chunkPos|T|0x06966e02|0x06966e02|0x06966e02|0x06966e02
+          HELP_chunkPos2|T|0x06962754|0x06962754|0x06962754|0x06962754
+          HELP_chunkSetSh|T|0x0696edaa|0x0696edaa|0x0696edaa|0x0696edaa
+          HELP_chunkFlag|T|0x0697025c|0x0697025c|0x0697025c|0x0697025c
+          HELP_camRegion|T|0x073b1540|0x073b1540|0x073b1540|0x073b1540
+          HELP_camGetX|T|0x073b37a4|0x073b37a4|0x073b37a4|0x073b37a4
+          HELP_builderCtor|T|0x06962188|0x06962188|0x06962188|0x06962188
+          MCRE_EOF
+
+      - name: Verify the files arrived intact
+        run: |
+          cat > work/MANIFEST.sha <<'MCRE_EOF'
+          b791ad2f29f54e8a79360eed6d42efb030f95dde316c466f1801e4457540a825  work/callers.py
+          bf77a1adde0851bd695b609a02c75b877dd4d4458bad8f1b11cd342b66819755  work/DecompileCandidates.java
+          bdf35af31bb7f453f5a014fa665f99f83467b9b5997715d8910f173ec895b517  work/seeds2.psv
+          MCRE_EOF
+          sha256sum -c work/MANIFEST.sha || { echo "A file was damaged when pasting analyze2.yml - paste it again completely"; exit 1; }
+          sed 's/|/\t/g' work/seeds2.psv > work/seeds2.tsv
+          wc -l work/seeds2.tsv
+
+      - name: Find and unpack the library
+        run: |
+          set -eu
+          EXPECT_SHA="${EXPECT_SHA:-629c94e3d8a67f6f6de8296e9ebe9739cddbe4adc7e64ff699f32b289c82685b}"
+          command -v 7z >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full; }
+          FIRST="$(find . -path ./.git -prune -o -type f -name '*.7z.001' -print | sort | head -n 1)"
+          if [ -z "$FIRST" ]; then FIRST="$(find . -path ./.git -prune -o -type f -name '*.7z' -print | sort | head -n 1)"; fi
+          if [ -z "$FIRST" ]; then
+            echo "No .7z / .7z.001 file found. Files over 1 MB in the repo:"
+            find . -path ./.git -prune -o -type f -size +1M -print | head -n 50
+            exit 1
+          fi
+          echo "first part: $FIRST"
+          mkdir -p work/lib
+          7z x -y -owork/lib "$FIRST" > work/7z.log 2>&1 || { tail -n 20 work/7z.log; echo "7z failed"; exit 1; }
+          LIB="$(find work/lib -type f -name 'libminecraftpe.so' | head -n 1)"
+          if [ -z "$LIB" ]; then LIB="$(find work/lib -type f -printf '%s %p\n' | sort -rn | head -n 1 | cut -d' ' -f2-)"; fi
+          [ -n "$LIB" ] || { echo "nothing came out of the archive"; exit 1; }
+          echo "$EXPECT_SHA  $LIB" | sha256sum -c - || { echo "This is not the library build we expect (1.26.62.1)"; exit 1; }
+          echo "LIB=$PWD/$LIB" >> "$GITHUB_ENV"
+
+      - name: Find the callers (BL / B.W scan)
+        continue-on-error: true
+        timeout-minutes: 40
+        run: |
+          set -eu
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install -q numpy
+          python work/callers.py "$LIB" out/callers 2>&1 | tee out/callers.log
+
+      - name: Build the decompile list
+        run: |
+          set -eu
+          {
+            cat work/seeds2.tsv
+            if [ -f out/callers/callers_candidates.tsv ]; then tail -n +2 out/callers/callers_candidates.tsv; fi
+          } > work/candidates_all.tsv
+          cp work/candidates_all.tsv out/
+          wc -l work/candidates_all.tsv
+
+      - name: JDK for Ghidra
+        continue-on-error: true
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Ghidra - decompile the candidates
+        continue-on-error: true
+        timeout-minutes: 110
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          java -version 2>&1 | head -n 2
+          URL="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                 https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest \
+                 | jq -r '.assets[].browser_download_url' | grep -E 'ghidra_[0-9.]+_PUBLIC_[0-9]+\.zip$' | head -n 1)"
+          echo "Ghidra: $URL"
+          curl -fsSL -o ghidra.zip "$URL"
+          mkdir -p gh && unzip -q ghidra.zip -d gh
+          GH="$(ls -d gh/ghidra_*_PUBLIC | head -n 1)"
+          MEM_G="$(awk '/MemTotal/ { g=int($2*0.75/1048576); if (g<4) g=4; print g }' /proc/meminfo)"
+          sed -i "s/^MAXMEM=.*/MAXMEM=${MEM_G}G/" "$GH/support/analyzeHeadless"
+          mkdir -p ghproj out/dec
+          "$GH/support/analyzeHeadless" "$PWD/ghproj" mc -import "$LIB" -overwrite -noanalysis \
+              -scriptPath "$PWD/work" \
+              -postScript DecompileCandidates.java "$PWD/out/dec" "$PWD/work/candidates_all.tsv" \
+              2>&1 | tee out/ghidra.log | tail -n 60
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcre2-results
+          path: out/
+          if-no-files-found: warn
