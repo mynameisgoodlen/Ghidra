@@ -19,12 +19,12 @@ jobs:
           mkdir -p mod out
           cat > mod/fpsboost.c <<'FPSBOOST_EOF'
           /*
-           * FpsBoost 1.1 - LeviLauncher native mod, 32-bit ARM (armeabi-v7a)
+           * FpsBoost 1.3 - LeviLauncher native mod, 32-bit ARM (armeabi-v7a)
            *
            * One source, four builds (define exactly one):
            *   -DFB_OFF      libfpsboost_off.so      does nothing at all (baseline)
            *   -DFB_EXP      libfpsboost.so          worker-thread experiment
-           *   -DFB_MEASURE  libfpsboost_measure.so  read-only thread/core report
+           *   -DFB_MEASURE  libfpsboost_measure.so  read-only thread/core report + sampling profiler (diagnostics only)
            *   -DFB_CULL     libfpsboost_cull.so     the EXP thread move PLUS two hooks (see below)
            *
            * OFF / EXP / MEASURE: no hooks, no signals, no GL, no work on the game's MAIN or
@@ -49,10 +49,13 @@ jobs:
            *   poll_ms=3000    EXP: scan interval
            *   log=1           0 = create/write no log file at all
            *   report_s=30     MEASURE: seconds between reports
+           *   prof=1          MEASURE: 0 = no profiler, thread report only
+           *   prof_hz=400     MEASURE: samples per second of process CPU time (50..1000)
            *   threads=1       CULL: 0 = do not move worker threads
-           *   entity_cull=1   CULL: 0 = do not hook the entity callback
+           *   hooks=1         CULL, read at start only: 0 = never install the hooks (thread move only)
+           *   entity_cull=1   CULL: entity culling on/off - LIVE, the file is re-read every ~2 s while the game runs
            *   entity_blocks=64   CULL: entity draw distance in blocks (16..1024)
-           *   chunk_pace=1    CULL: 0 = do not hook scheduleChunkBuild
+           *   chunk_pace=1    CULL: chunk pacing on/off - LIVE. Deleting the file = all defaults again.
            *   chunk_budget=4  CULL: far chunk builds started per frame (1..256); 1-2 smoothest, 8+ close to vanilla
            *   chunk_near=24   CULL: chunks closer than this many blocks are never held back (8..128)
            *   gap_us=3000     CULL: pause between calls that counts as a new frame (500..50000)
@@ -73,6 +76,9 @@ jobs:
           #include <link.h>
           #include <dlfcn.h>
           #include <stdint.h>
+          #include <signal.h>
+          #include <ucontext.h>
+          #include <sys/time.h>
           #include <sys/stat.h>
           #include <sys/types.h>
           #include <sys/resource.h>
@@ -83,7 +89,7 @@ jobs:
           #error "define exactly one of FB_OFF, FB_EXP, FB_MEASURE, FB_CULL"
           #endif
 
-          #define FB_VERSION "1.1"
+          #define FB_VERSION "1.3"
           #define FB_EXPORT __attribute__((visibility("default")))
 
           #ifdef FB_OFF
@@ -137,8 +143,12 @@ jobs:
           #endif
 
           struct cfg { int nice, min_cpu_ms, poll_ms, log, report_s,
-                       threads, entity_cull, entity_blocks, chunk_pace, chunk_budget, chunk_near, gap_us, stats_s; };
-          static struct cfg g_cfg = { 4, 500, 3000, 1, 30,  1, 1, 64, 1, 4, 24, 3000, 30 };
+                       threads, entity_cull, entity_blocks, chunk_pace, chunk_budget, chunk_near, gap_us, stats_s, hooks,
+                       prof, prof_hz; };
+          #ifdef FB_CULL
+          static const struct cfg g_cfg_default = { 4, 500, 3000, 1, 30,  1, 1, 64, 1, 4, 24, 3000, 30, 1,  1, 400 };
+          #endif
+          static struct cfg g_cfg = { 4, 500, 3000, 1, 30,  1, 1, 64, 1, 4, 24, 3000, 30, 1,  1, 400 };
 
           static volatile int g_stop;
           static volatile int g_active = 1;
@@ -243,6 +253,9 @@ jobs:
                       else if (!strcmp(k, "log"))         g_cfg.log        = x != 0;
                       else if (!strcmp(k, "report_s"))    g_cfg.report_s   = clampi(x, 5, 600);
                       else if (!strcmp(k, "threads"))       g_cfg.threads       = x != 0;
+                      else if (!strcmp(k, "hooks"))         g_cfg.hooks         = x != 0;
+                      else if (!strcmp(k, "prof"))          g_cfg.prof          = x != 0;
+                      else if (!strcmp(k, "prof_hz"))       g_cfg.prof_hz       = clampi(x, 50, 1000);
                       else if (!strcmp(k, "entity_cull"))   g_cfg.entity_cull   = x != 0;
                       else if (!strcmp(k, "entity_blocks")) g_cfg.entity_blocks = clampi(x, 16, 1024);
                       else if (!strcmp(k, "chunk_pace"))    g_cfg.chunk_pace    = x != 0;
@@ -434,6 +447,60 @@ jobs:
           }
           #endif
 
+          /* bounded printf-append: never writes past the buffer */
+          #ifdef FB_MEASURE
+          static void sappend(char *buf, size_t sz, size_t *len, const char *fmt, ...) {
+              if (*len >= sz - 1) return;
+              va_list ap;
+              va_start(ap, fmt);
+              int w = vsnprintf(buf + *len, sz - *len, fmt, ap);
+              va_end(ap);
+              if (w < 0) return;
+              size_t room = sz - *len - 1;
+              *len += (size_t)w < room ? (size_t)w : room;
+          }
+          #endif
+
+          #if defined(FB_CULL) || defined(FB_MEASURE)
+          struct gameinfo { int found; uintptr_t base, end; char build_id[96]; };
+
+          static int gi_cb(struct dl_phdr_info *info, size_t sz, void *data) {
+              (void)sz;
+              struct gameinfo *g = (struct gameinfo *)data;
+              if (!info->dlpi_name || !strstr(info->dlpi_name, FB_GAME_LIB)) return 0;
+              g->found = 1;
+              g->base = (uintptr_t)info->dlpi_addr;
+              for (int i = 0; i < info->dlpi_phnum; i++) {
+                  const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+                  if (ph->p_type == PT_LOAD) {
+                      uintptr_t e = (uintptr_t)info->dlpi_addr + ph->p_vaddr + ph->p_memsz;
+                      if (e > g->end) g->end = e;
+                  }
+                  if (ph->p_type != PT_NOTE || ph->p_memsz == 0 || ph->p_memsz > 4096) continue;
+                  const uint8_t *p = (const uint8_t *)(info->dlpi_addr + ph->p_vaddr);
+                  size_t off = 0, len = ph->p_memsz;
+                  while (off + 12 <= len) {
+                      uint32_t namesz = *(const uint32_t *)(p + off), descsz = *(const uint32_t *)(p + off + 4);
+                      uint32_t type = *(const uint32_t *)(p + off + 8);
+                      size_t noff = off + 12, doff = noff + ((namesz + 3u) & ~3u), next = doff + ((descsz + 3u) & ~3u);
+                      if (next > len) break;
+                      if (type == 3 && namesz == 4 && memcmp(p + noff, "GNU", 4) == 0 && descsz * 2 + 1 < sizeof g->build_id)
+                          for (uint32_t j = 0; j < descsz; j++) snprintf(g->build_id + j * 2, 3, "%02x", p[doff + j]);
+                      off = next;
+                  }
+              }
+              return 1;
+          }
+          #ifndef FB_FIND_GAME
+          static int find_game(struct gameinfo *g) {
+              memset(g, 0, sizeof *g);
+              dl_iterate_phdr(gi_cb, g);
+              return g->found;
+          }
+          #define FB_FIND_GAME(g) find_game(g)
+          #endif
+          #endif
+
           /* -------------------------------------------------------------- MEASURE */
           #ifdef FB_MEASURE
           struct row { int tid, pct10, cpu; char name[20]; };
@@ -501,6 +568,304 @@ jobs:
               g_nprev = n;
               g_prev_ms = t;
           }
+
+          /* ------------------------------------------------------ sampling profiler (MEASURE only) */
+          #ifndef FB_MAPS_PATH
+          #define FB_MAPS_PATH "/proc/self/maps"
+          #endif
+          #define PF_MAX     60000
+          #define PF_DEPTH   6
+          #define PF_MAXMAPS 8192
+
+          struct pfs { uint32_t tid; uintptr_t pc, lr, ra[PF_DEPTH]; };
+          struct mapr { uintptr_t lo, hi; };
+          static struct pfs g_pf[PF_MAX];
+          static volatile uint32_t g_pf_n;
+          static volatile int g_pf_on;
+          static struct mapr g_maps[2][PF_MAXMAPS];
+          static volatile int g_maps_cur;
+          static volatile int g_maps_n[2];
+          static uintptr_t g_game_base, g_game_end;
+          static unsigned g_pf_window;
+
+          /* is [a, a+n) inside one readable+writable mapping?  (frame records only live on stacks) */
+          __attribute__((no_sanitize("address")))
+          static int mem_ok(uintptr_t a, size_t n) {
+              int c = g_maps_cur, cnt = g_maps_n[c];
+              const struct mapr *t = g_maps[c];
+              int lo = 0, hi = cnt - 1, best = -1;
+              while (lo <= hi) {
+                  int mid = (lo + hi) / 2;
+                  if (t[mid].lo <= a) { best = mid; lo = mid + 1; } else hi = mid - 1;
+              }
+              return best >= 0 && a + n >= a && a + n <= t[best].hi;
+          }
+
+          static void pf_refresh_maps(void) {
+              FILE *f = fopen(FB_MAPS_PATH, "r");
+              if (!f) return;
+              int w = 1 - g_maps_cur, n = 0;
+              char line[512];
+              while (n < PF_MAXMAPS && fgets(line, sizeof line, f)) {
+                  unsigned long lo, hi;
+                  char perms[8];
+                  if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) != 3) continue;
+                  if (perms[0] != 'r' || perms[1] != 'w') continue;
+                  if (n && g_maps[w][n - 1].hi == lo) g_maps[w][n - 1].hi = hi;
+                  else { g_maps[w][n].lo = lo; g_maps[w][n].hi = hi; n++; }
+              }
+              fclose(f);
+              g_maps_n[w] = n;
+              g_maps_cur = w;
+          }
+
+          /* follow the frame-pointer chain: [fp] = caller's fp, [fp+W] = return address into the caller.
+           * Every step is bounds-checked against the mapping table, so a wrong guess just stops the walk. */
+          __attribute__((no_sanitize("address")))
+          static int pf_walk(uintptr_t fp, uintptr_t sp, uintptr_t *out, int max) {
+              int n = 0;
+              uintptr_t last = sp;
+              while (n < max) {
+                  if ((fp & (sizeof(void *) - 1)) || fp < last || !mem_ok(fp, 2 * sizeof(void *))) break;
+                  const uintptr_t *fr = (const uintptr_t *)fp;
+                  uintptr_t nfp = fr[0], ra = fr[1];
+                  out[n++] = ra;
+                  if (nfp <= fp) break;
+                  last = fp + 2 * sizeof(void *);
+                  fp = nfp;
+              }
+              return n;
+          }
+
+          __attribute__((no_sanitize("address")))
+          static void pf_handler(int sig, siginfo_t *si, void *ctx) {
+              (void)sig; (void)si;
+              if (!g_pf_on) return;
+              uint32_t i = __atomic_fetch_add(&g_pf_n, 1, __ATOMIC_RELAXED);
+              if (i >= PF_MAX) return;
+              struct pfs *s = &g_pf[i];
+              const ucontext_t *uc = (const ucontext_t *)ctx;
+              uintptr_t fp = 0, sp = 0;
+          #if defined(__arm__)
+              s->pc = (uintptr_t)uc->uc_mcontext.arm_pc;
+              s->lr = (uintptr_t)uc->uc_mcontext.arm_lr;
+              fp = (uintptr_t)uc->uc_mcontext.arm_r7;            /* r7 is the frame pointer in Thumb code */
+              sp = (uintptr_t)uc->uc_mcontext.arm_sp;
+          #elif defined(__x86_64__)
+              s->pc = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+              s->lr = 0;
+              fp = (uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
+              sp = (uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+          #else
+              (void)uc; s->pc = s->lr = 0;
+          #endif
+              s->tid = (uint32_t)syscall(__NR_gettid);
+              for (int k = 0; k < PF_DEPTH; k++) s->ra[k] = 0;
+              pf_walk(fp, sp, s->ra, PF_DEPTH);
+          }
+
+          static void pf_timer(int on) {
+              struct itimerval it;
+              memset(&it, 0, sizeof it);
+              if (on) {
+                  long us = 1000000L / g_cfg.prof_hz;
+                  it.it_interval.tv_usec = us;
+                  it.it_value.tv_usec = us;
+              }
+              setitimer(ITIMER_PROF, &it, NULL);
+          }
+
+          static void pf_start(void) {
+              if (!g_cfg.prof || g_pf_on) return;
+              struct gameinfo gi;
+              if (!FB_FIND_GAME(&gi)) return;
+              g_game_base = gi.base;
+              g_game_end = gi.end;
+              pf_refresh_maps();
+              struct sigaction sa;
+              memset(&sa, 0, sizeof sa);
+              sa.sa_sigaction = pf_handler;
+              sa.sa_flags = SA_SIGINFO | SA_RESTART;
+              sigemptyset(&sa.sa_mask);
+              if (sigaction(SIGPROF, &sa, NULL) != 0) { flog("profiler: sigaction failed"); return; }
+              g_pf_n = 0;
+              g_pf_on = 1;
+              pf_timer(1);
+              flog("profiler: %d samples/s of CPU time, game code at 0x%lx-0x%lx, report every %d s",
+                   g_cfg.prof_hz, (unsigned long)g_game_base, (unsigned long)g_game_end, g_cfg.report_s);
+          }
+
+          static void pf_stop(void) {          /* the handler stays installed but ignores everything */
+              if (g_pf_on) { pf_timer(0); g_pf_on = 0; }
+          }
+
+          /* start of the game function that contains pc (best guess: nearest 'push {..., lr}' before it) */
+          static uintptr_t guess_func(uintptr_t pc) {
+              pc &= ~(uintptr_t)1;
+              if (pc < g_game_base || pc >= g_game_end) return 0;
+          #if defined(__arm__)
+              const uint16_t *lo = (const uint16_t *)g_game_base;
+              for (int i = 0; i < 0x1800; i++) {
+                  const uint16_t *q = (const uint16_t *)pc - i;
+                  if (q < lo) break;
+                  uint16_t h = q[0];
+                  if ((h & 0xFF00) == 0xB500) return (uintptr_t)q;
+                  if (h == 0xE92D && (q[1] & 0x4000)) return (uintptr_t)q;
+              }
+              return 0;
+          #else
+              Dl_info di;
+              if (dladdr((void *)pc, &di) && di.dli_saddr) return (uintptr_t)di.dli_saddr;
+              return 0;
+          #endif
+          }
+
+          static int in_game(uintptr_t a) { a &= ~(uintptr_t)1; return a >= g_game_base && a < g_game_end; }
+
+          /* the first game-code address on the call chain = the game function that is responsible for this sample */
+          static uintptr_t pf_site(const struct pfs *s) {
+              if (in_game(s->pc)) return guess_func(s->pc);
+              if (s->lr && in_game(s->lr)) return guess_func(s->lr);
+              for (int k = 0; k < PF_DEPTH; k++)
+                  if (s->ra[k] && in_game(s->ra[k])) return guess_func(s->ra[k]);
+              return 0;
+          }
+
+          struct pfrow { uintptr_t fn; uint32_t n; char key[72]; };
+          #define PF_ROWS 512
+
+          static void pf_key(uintptr_t pc, char *out, size_t sz) {
+              Dl_info di;
+              memset(&di, 0, sizeof di);
+              snprintf(out, sz, "?");
+              if (dladdr((void *)pc, &di) && di.dli_fname) {
+                  const char *slash = strrchr(di.dli_fname, '/');
+                  const char *lib = slash ? slash + 1 : di.dli_fname;
+                  if (di.dli_sname && (uintptr_t)pc - (uintptr_t)di.dli_saddr < 0x1000) snprintf(out, sz, "%s:%s", lib, di.dli_sname);
+                  else snprintf(out, sz, "%s:?", lib);
+              }
+          }
+
+          static int pf_add(struct pfrow *rows, int *nrows, uintptr_t fn, const char *key) {
+              for (int i = 0; i < *nrows; i++)
+                  if (rows[i].fn == fn && strcmp(rows[i].key, key) == 0) { rows[i].n++; return 1; }
+              if (*nrows >= PF_ROWS) return 0;
+              rows[*nrows].fn = fn;
+              rows[*nrows].n = 1;
+              snprintf(rows[*nrows].key, sizeof rows[*nrows].key, "%s", key);
+              (*nrows)++;
+              return 1;
+          }
+
+          static int pf_top(const struct pfrow *rows, int n, int *used) {        /* index of the biggest unused row, -1 if none */
+              int best = -1;
+              for (int i = 0; i < n; i++)
+                  if (!used[i] && (best < 0 || rows[i].n > rows[best].n)) best = i;
+              if (best >= 0) used[best] = 1;
+              return best;
+          }
+
+          static void pf_pct(char *out, size_t sz, uint32_t n, uint32_t total) {
+              uint32_t t10 = total ? (uint32_t)((uint64_t)n * 1000 / total) : 0;
+              snprintf(out, sz, "%u.%u%%", t10 / 10, t10 % 10);
+          }
+
+          static void pf_report(void) {
+              if (!g_pf_on) return;
+              static struct pfs snap[PF_MAX];
+              static struct pfrow self_rows[PF_ROWS], ext_rows[PF_ROWS], key_rows[PF_ROWS];
+              pf_refresh_maps();
+              pf_timer(0);
+              uint32_t n = g_pf_n;
+              if (n > PF_MAX) n = PF_MAX;
+              memcpy(snap, g_pf, (size_t)n * sizeof snap[0]);
+              g_pf_n = 0;
+              pf_timer(1);
+              if (n < 20) return;
+              g_pf_window++;
+
+              struct { uint32_t tid, total; } th[64];
+              int nth = 0;
+              for (uint32_t i = 0; i < n; i++) {
+                  int k = 0;
+                  while (k < nth && th[k].tid != snap[i].tid) k++;
+                  if (k == nth) { if (nth >= 64) continue; th[nth].tid = snap[i].tid; th[nth].total = 0; nth++; }
+                  th[k].total++;
+              }
+              for (int a = 0; a < nth; a++)
+                  for (int b = a + 1; b < nth; b++)
+                      if (th[b].total > th[a].total) { uint32_t t0 = th[a].tid, t1 = th[a].total; th[a] = th[b]; th[b].tid = t0; th[b].total = t1; }
+              flog("prof window %u: %u samples from %d threads", g_pf_window, n, nth);
+
+              char tsvpath[512] = "";
+              if (g_ndirs > 0) snprintf(tsvpath, sizeof tsvpath, "%s/profile.tsv", g_dirs[0]);
+              FILE *tsv = g_cfg.log && tsvpath[0] ? fopen(tsvpath, "a") : NULL;
+
+              for (int ti = 0; ti < nth && ti < 4; ti++) {
+                  struct thr t;
+                  char name[24];
+                  if (read_thr((int)th[ti].tid, &t)) snprintf(name, sizeof name, "%s", t.name); else snprintf(name, sizeof name, "tid%u", th[ti].tid);
+                  int ns = 0, ne = 0, nk = 0;
+                  uint32_t game = 0, total = th[ti].total;
+                  for (uint32_t i = 0; i < n; i++) {
+                      const struct pfs *s = &snap[i];
+                      if (s->tid != th[ti].tid) continue;
+                      if (in_game(s->pc)) {
+                          game++;
+                          char key[8] = "game";
+                          pf_add(self_rows, &ns, guess_func(s->pc), key);
+                      } else {
+                          char key[72];
+                          pf_key(s->pc, key, sizeof key);
+                          pf_add(key_rows, &nk, 0, key);
+                          pf_add(ext_rows, &ne, pf_site(s), key);
+                      }
+                  }
+                  char pg[16], pk[16];
+                  pf_pct(pg, sizeof pg, game, total);
+                  char line[900];
+                  size_t len = 0;
+                  line[0] = 0;
+                  sappend(line, sizeof line, &len, "prof [%s/%u] %u samples, in game code %s, outside:", name, th[ti].tid, total, pg);
+                  int used[PF_ROWS];
+                  memset(used, 0, sizeof used);
+                  for (int k = 0; k < 7; k++) {
+                      int b = pf_top(key_rows, nk, used);
+                      if (b < 0) break;
+                      pf_pct(pk, sizeof pk, key_rows[b].n, total);
+                      sappend(line, sizeof line, &len, " %s=%s", key_rows[b].key, pk);
+                      if (tsv) fprintf(tsv, "%u\t%s\tout\t%s\t0\t%u\t%s\n", g_pf_window, name, key_rows[b].key, key_rows[b].n, pk);
+                  }
+                  flog("%s", line);
+
+                  len = 0; line[0] = 0;
+                  sappend(line, sizeof line, &len, "prof [%s] busiest game functions (rva=share):", name);
+                  memset(used, 0, sizeof used);
+                  for (int k = 0; k < 14; k++) {
+                      int b = pf_top(self_rows, ns, used);
+                      if (b < 0 || self_rows[b].n < 2) break;
+                      pf_pct(pk, sizeof pk, self_rows[b].n, total);
+                      sappend(line, sizeof line, &len, " 0x%x=%s", (unsigned)(self_rows[b].fn - g_game_base), pk);
+                      if (tsv) fprintf(tsv, "%u\t%s\tgame\t-\t0x%x\t%u\t%s\n", g_pf_window, name, (unsigned)(self_rows[b].fn - g_game_base), self_rows[b].n, pk);
+                  }
+                  flog("%s", line);
+
+                  len = 0; line[0] = 0;
+                  sappend(line, sizeof line, &len, "prof [%s] outside-game time, by the game function that called it (what<-rva=share):", name);
+                  memset(used, 0, sizeof used);
+                  for (int k = 0; k < 12; k++) {
+                      int b = pf_top(ext_rows, ne, used);
+                      if (b < 0 || ext_rows[b].n < 3) break;
+                      pf_pct(pk, sizeof pk, ext_rows[b].n, total);
+                      sappend(line, sizeof line, &len, " %s<-0x%x=%s", ext_rows[b].key,
+                              ext_rows[b].fn ? (unsigned)(ext_rows[b].fn - g_game_base) : 0u, pk);
+                      if (tsv) fprintf(tsv, "%u\t%s\text\t%s\t0x%x\t%u\t%s\n", g_pf_window, name, ext_rows[b].key,
+                                       ext_rows[b].fn ? (unsigned)(ext_rows[b].fn - g_game_base) : 0u, ext_rows[b].n, pk);
+                  }
+                  flog("%s", line);
+              }
+              if (tsv) fclose(tsv);
+          }
           #endif
 
           /* ----------------------------------------------------------------- CULL */
@@ -535,7 +900,8 @@ jobs:
           static getpos_fn  g_getpos;
           static pthread_mutex_t g_hook_mx = PTHREAD_MUTEX_INITIALIZER;
           static int   g_hooks_state;                 /* 0 = not tried yet, 1 = done (installed or gave up for good) */
-          static volatile int g_ent_on, g_pace_on;    /* a hook counts as on only after pl_hook succeeded */
+          static volatile int g_ent_on, g_pace_on;    /* installed: set only after pl_hook succeeded */
+          static volatile int g_ent_enabled = 1, g_pace_enabled = 1;   /* live switches from the config file */
           static float g_ent_r2, g_near2;
           static int   g_budget;
           static long long g_gap_us;
@@ -545,7 +911,7 @@ jobs:
 
           /* entity cull: skip the actor when it is farther than entity_blocks from the camera */
           static void det_actor(void *self, void *actor) {
-              if (g_active && g_ent_on) {
+              if (g_active && g_ent_on && g_ent_enabled) {
                   void *cam = *(void **)((char *)self + 0x10);
                   const float *ap = cam ? g_getpos(actor) : NULL;
                   if (ap) {
@@ -563,7 +929,7 @@ jobs:
 
           /* chunk pace: after g_budget builds in one frame, far chunks wait for the next frame */
           static int det_sched(void *self, void *chunk, const float *cam, void *camera) {
-              if (g_active && g_pace_on && chunk && cam) {
+              if (g_active && g_pace_on && g_pace_enabled && chunk && cam) {
                   long long t = FB_NOW_US();
                   if (t - g_last_us > g_gap_us) g_frame_built = 0;           /* a pause = a new frame */
                   g_last_us = t;
@@ -586,39 +952,6 @@ jobs:
               return r;
           }
 
-          struct gameinfo { int found; uintptr_t base; char build_id[96]; };
-
-          static int gi_cb(struct dl_phdr_info *info, size_t sz, void *data) {
-              (void)sz;
-              struct gameinfo *g = (struct gameinfo *)data;
-              if (!info->dlpi_name || !strstr(info->dlpi_name, FB_GAME_LIB)) return 0;
-              g->found = 1;
-              g->base = (uintptr_t)info->dlpi_addr;
-              for (int i = 0; i < info->dlpi_phnum; i++) {
-                  const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
-                  if (ph->p_type != PT_NOTE || ph->p_memsz == 0 || ph->p_memsz > 4096) continue;
-                  const uint8_t *p = (const uint8_t *)(info->dlpi_addr + ph->p_vaddr);
-                  size_t off = 0, len = ph->p_memsz;
-                  while (off + 12 <= len) {
-                      uint32_t namesz = *(const uint32_t *)(p + off), descsz = *(const uint32_t *)(p + off + 4);
-                      uint32_t type = *(const uint32_t *)(p + off + 8);
-                      size_t noff = off + 12, doff = noff + ((namesz + 3u) & ~3u), next = doff + ((descsz + 3u) & ~3u);
-                      if (next > len) break;
-                      if (type == 3 && namesz == 4 && memcmp(p + noff, "GNU", 4) == 0 && descsz * 2 + 1 < sizeof g->build_id)
-                          for (uint32_t j = 0; j < descsz; j++) snprintf(g->build_id + j * 2, 3, "%02x", p[doff + j]);
-                      off = next;
-                  }
-              }
-              return 1;
-          }
-          #ifndef FB_FIND_GAME
-          static int find_game(struct gameinfo *g) {
-              memset(g, 0, sizeof *g);
-              dl_iterate_phdr(gi_cb, g);
-              return g->found;
-          }
-          #define FB_FIND_GAME(g) find_game(g)
-          #endif
 
           /* same lookup that worked in the earlier builds */
           static void resolve_preloader(void) {
@@ -638,39 +971,76 @@ jobs:
               if (h) g_pl_hook = (pl_hook_fn)dlsym(h, "pl_hook");
           }
 
+          /* values the detours read; refreshed whenever the config file changes */
+          static void apply_live(void) {
+              g_ent_r2   = (float)g_cfg.entity_blocks * (float)g_cfg.entity_blocks;
+              g_near2    = (float)g_cfg.chunk_near * (float)g_cfg.chunk_near;
+              g_budget   = g_cfg.chunk_budget;
+              g_gap_us   = g_cfg.gap_us;
+              g_ent_enabled  = g_cfg.entity_cull;
+              g_pace_enabled = g_cfg.chunk_pace;
+          }
+
+          /* size + modification time of the config file that load_cfg() would read (0 = none) */
+          static long long g_cfg_stamp;
+          static long long cfg_stamp(void) {
+              for (int d = 0; d < g_ndirs; d++) {
+                  char p[512];
+                  struct stat st;
+                  snprintf(p, sizeof p, "%s/FpsBoost.cfg", g_dirs[d]);
+                  if (stat(p, &st) == 0)
+                      return ((long long)st.st_mtim.tv_sec * 1000003LL + st.st_mtim.tv_nsec / 1000) * 31 + (long long)st.st_size + 1;
+              }
+              return 0;
+          }
+
+          /* called from the worker every ~2 s */
+          static void cfg_reload_if_changed(void) {
+              long long st = cfg_stamp();
+              if (st == g_cfg_stamp) return;
+              g_cfg_stamp = st;
+              int keep_log = g_cfg.log;
+              g_cfg = g_cfg_default;
+              char used[512] = "";
+              int have = st != 0 && load_cfg(used, sizeof used);
+              if (!g_cfg.log && keep_log) { g_cfg.log = 1; flog("config reloaded: log=0 - the log goes quiet now"); g_cfg.log = 0; }
+              apply_live();
+              flog("config reloaded (%s): entity_cull=%d (%d blocks) chunk_pace=%d (budget %d, near %d)",
+                   have ? used : "file removed, defaults", g_cfg.entity_cull, g_cfg.entity_blocks,
+                   g_cfg.chunk_pace, g_cfg.chunk_budget, g_cfg.chunk_near);
+          }
+
           static void install_hooks(uintptr_t base, const char *bid) {
               flog("game module base=0x%08lx build-id=%s", (unsigned long)base, bid[0] ? bid : "(unreadable)");
               if (bid[0] && strcmp(bid, EXPECTED_BUILD_ID) != 0) {
                   flog("UNSUPPORTED game build (expected %s) - no hook installed", EXPECTED_BUILD_ID);
                   return;
               }
-              if (!g_cfg.entity_cull && !g_cfg.chunk_pace) { flog("both culls are off in the config - no hook installed"); return; }
+              if (!g_cfg.hooks) { flog("hooks=0 in the config - no hook installed (thread move only)"); return; }
+              apply_live();
               if (!g_pl_hook) resolve_preloader();
               if (!g_pl_hook) { flog("pl_hook not found in this process - no hook installed"); return; }
 
-              if (g_cfg.entity_cull) {
+              {
                   if (memcmp((const void *)(base + RVA_ACTOR), PFX_ACTOR, sizeof PFX_ACTOR) != 0 ||
                       memcmp((const void *)(base + RVA_GETPOS), PFX_GETPOS, sizeof PFX_GETPOS) != 0) {
                       flog("entity cull SKIPPED: the game bytes at 0x%08x / 0x%08x are not what was analysed", RVA_ACTOR, RVA_GETPOS);
                   } else {
                       g_getpos = (getpos_fn)(base + RVA_GETPOS + 1u);                    /* +1 = Thumb */
-                      g_ent_r2 = (float)g_cfg.entity_blocks * (float)g_cfg.entity_blocks;
                       int r = g_pl_hook((void *)(base + RVA_ACTOR + 1u), (void *)det_actor, (void **)&g_orig_actor, 200);
                       if (r == 0 && g_orig_actor) g_ent_on = 1;
-                      flog("entity cull: hook ret=%d -> %s (distance %d blocks)", r, g_ent_on ? "ON" : "OFF", g_cfg.entity_blocks);
+                      flog("entity cull: hook ret=%d -> %s, currently %s (distance %d blocks)", r, g_ent_on ? "installed" : "NOT installed",
+                           g_ent_enabled ? "ON" : "off", g_cfg.entity_blocks);
                   }
               }
-              if (g_cfg.chunk_pace) {
+              {
                   if (memcmp((const void *)(base + RVA_SCHED), PFX_SCHED, sizeof PFX_SCHED) != 0) {
                       flog("chunk pace SKIPPED: the game bytes at 0x%08x are not what was analysed", RVA_SCHED);
                   } else {
-                      g_budget = g_cfg.chunk_budget;
-                      g_near2 = (float)g_cfg.chunk_near * (float)g_cfg.chunk_near;
-                      g_gap_us = g_cfg.gap_us;
                       int r = g_pl_hook((void *)(base + RVA_SCHED + 1u), (void *)det_sched, (void **)&g_orig_sched, 200);
                       if (r == 0 && g_orig_sched) g_pace_on = 1;
-                      flog("chunk pace: hook ret=%d -> %s (%d far builds per frame, chunks within %d blocks never held back)",
-                           r, g_pace_on ? "ON" : "OFF", g_cfg.chunk_budget, g_cfg.chunk_near);
+                      flog("chunk pace: hook ret=%d -> %s, currently %s (%d far builds per frame, chunks within %d blocks never held back)",
+                           r, g_pace_on ? "installed" : "NOT installed", g_pace_enabled ? "ON" : "off", g_cfg.chunk_budget, g_cfg.chunk_near);
                   }
               }
           }
@@ -709,6 +1079,10 @@ jobs:
               int have_cfg = load_cfg(used, sizeof used);
               if (g_cfg.log) choose_logpath();
               pick_cores(&g_cs);
+          #ifdef FB_CULL
+              g_cfg_stamp = cfg_stamp();
+              apply_live();
+          #endif
 
               flog("=== FpsBoost %s (%s) pid %d ===", FB_VERSION, FB_VARIANT, (int)getpid());
               flog("config: %s", have_cfg ? used : "none, built-in defaults");
@@ -727,7 +1101,7 @@ jobs:
           #endif
                    g_cs.ok ? "" : " | DISABLED on this CPU");
           #else
-              flog("measure: report every %d s, nothing is changed", g_cfg.report_s);
+              flog("measure: report every %d s, nothing is changed (profiler %s)", g_cfg.report_s, g_cfg.prof ? "on" : "off");
           #endif
           }
 
@@ -749,24 +1123,37 @@ jobs:
           #endif
 
               const int tick = 100;
-              int announced = 0, since_scan = interval, since_stats = 0, since_try = 1 << 20;
-              (void)since_stats; (void)since_try;
+              int announced = 0, since_scan = interval, since_stats = 0, since_try = 1 << 20, since_cfg = 0, since_maps = 0;
+              (void)since_stats; (void)since_try; (void)since_cfg; (void)since_maps;
               for (;;) {
                   sleep_ms(tick);
                   if (g_stop) break;
-                  since_scan += tick; since_stats += tick; since_try += tick;
+                  since_scan += tick; since_stats += tick; since_try += tick; since_cfg += tick; since_maps += tick;
                   if (!g_active) continue;
+          #ifdef FB_CULL
+                  if (since_cfg >= 2000) { since_cfg = 0; cfg_reload_if_changed(); }
+          #endif
           #ifdef FB_CULL
                   if (!g_hooks_state && since_try >= 1000) { since_try = 0; try_install(); }
           #endif
                   if (!game_loaded()) continue;
-                  if (!announced) { announced = 1; flog("game library present, running"); }
+                  if (!announced) {
+                      announced = 1;
+                      flog("game library present, running");
+          #ifdef FB_MEASURE
+                      pf_start();
+          #endif
+                  }
+          #ifdef FB_MEASURE
+                  if (since_maps >= 1000) { since_maps = 0; if (g_pf_on) pf_refresh_maps(); }   /* new threads = new stacks */
+          #endif
                   if (since_scan >= interval) {
                       since_scan = 0;
           #ifdef FB_THREADS
                       if (move_threads) exp_scan(&g_cs.slow, self);
           #else
                       measure_tick(&g_cs, self);
+                      pf_report();
           #endif
                   }
           #ifdef FB_CULL
@@ -798,7 +1185,14 @@ jobs:
           }
           FB_EXPORT bool PLMod_Enable(void)  { g_active = 1; return true; }
           FB_EXPORT bool PLMod_Disable(void) { g_active = 0; return true; }   /* stops further work; hooks (if any) become pass-through */
-          FB_EXPORT bool PLMod_Unload(void)  { g_active = 0; stop_worker(); return true; }
+          FB_EXPORT bool PLMod_Unload(void)  {
+              g_active = 0;
+          #ifdef FB_MEASURE
+              pf_stop();
+          #endif
+              stop_worker();
+              return true;
+          }
           FB_EXPORT bool LeviMod_Load(void)  { return PLMod_Load(); }
           #endif
           FPSBOOST_EOF
@@ -806,7 +1200,7 @@ jobs:
       - name: Verify the source arrived intact
         run: |
           wc -l mod/fpsboost.c
-          echo "1ef89d56f057567874b80824cdf0678bf73bb908678c8facdf1749e8bb275310  mod/fpsboost.c" | sha256sum -c - || { echo "Source was damaged when pasting build.yml - paste it again completely"; exit 1; }
+          echo "b170a62d4cb07a170f1560a1a7ad8547eea5e97e52cc7a3c022529126f9c9eae  mod/fpsboost.c" | sha256sum -c - || { echo "Source was damaged when pasting build.yml - paste it again completely"; exit 1; }
 
       - name: Compile 4 variants (armeabi-v7a, API 21)
         run: |
@@ -824,7 +1218,7 @@ jobs:
           FLAGS="-shared -fPIC -O2 -Wall -Wextra -std=gnu11 -fvisibility=hidden -Wl,--build-id -Wl,-z,noexecstack -s"
           "$CC" $FLAGS -DFB_OFF     -o out/libfpsboost_off.so     mod/fpsboost.c
           "$CC" $FLAGS -DFB_EXP     -o out/libfpsboost.so         mod/fpsboost.c
-          "$CC" $FLAGS -DFB_MEASURE -o out/libfpsboost_measure.so mod/fpsboost.c
+          "$CC" $FLAGS -DFB_MEASURE -o out/libfpsboost_measure.so mod/fpsboost.c -ldl
           "$CC" $FLAGS -DFB_CULL    -o out/libfpsboost_cull.so    mod/fpsboost.c -ldl
           ls -la out
 
@@ -854,11 +1248,16 @@ jobs:
             if grep -aq "pl_hook" "$f"; then echo "$f contains hook code"; exit 1; fi
           done
           grep -aq "pl_hook" out/libfpsboost_cull.so || { echo "CULL build has no hook code"; exit 1; }
+          # and only the MEASURE build uses signals / timers (the profiler).
+          for f in out/libfpsboost_off.so out/libfpsboost.so out/libfpsboost_cull.so; do
+            if "$NM" -D --undefined-only "$f" | grep -E "setitimer|sigaction"; then echo "$f uses signals"; exit 1; fi
+          done
+          "$NM" -D --undefined-only out/libfpsboost_measure.so | grep -q "setitimer" || { echo "MEASURE build has no profiler timer"; exit 1; }
           echo "checks passed"
 
       - name: Upload mods
         uses: actions/upload-artifact@v4
         with:
-          name: fpsboost-1.1
+          name: fpsboost-1.3
           path: out/*.so
           if-no-files-found: error
